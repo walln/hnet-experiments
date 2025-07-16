@@ -1,5 +1,5 @@
 [project]
-name = "h-net-jax"
+name = "hnet"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
@@ -7,14 +7,20 @@ authors = [
     { name = "Nick Wall", email = "46641379+walln@users.noreply.github.com" },
 ]
 requires-python = ">=3.12"
-dependencies = ["flax>=0.10.7", "jax>=0.6.2"]
+dependencies = [
+    "einops>=0.8.1",
+    "flax>=0.10.7",
+    "jax>=0.6.2",
+    "torch>=2.7.1",
+    "ty>=0.0.1a14",
+]
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [dependency-groups]
-dev = ["ruff>=0.12.3"]
+dev = ["pytest>=8.4.1", "ruff>=0.12.3"]
 
 [tool.ruff]
 # Basic settings
