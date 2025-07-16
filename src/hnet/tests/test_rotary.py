@@ -1,5 +1,3 @@
-"""Tests for JAX rotary positional embeddings."""
-
 import flax.nnx as nnx
 import jax
 import jax.numpy as jnp
