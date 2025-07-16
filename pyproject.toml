@@ -4,11 +4,61 @@ version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
 authors = [
-    { name = "Nick Wall", email = "46641379+walln@users.noreply.github.com" }
+    { name = "Nick Wall", email = "46641379+walln@users.noreply.github.com" },
 ]
 requires-python = ">=3.12"
-dependencies = []
+dependencies = ["flax>=0.10.7", "jax>=0.6.2"]
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = ["ruff>=0.12.3"]
+
+[tool.ruff]
+# Basic settings
+line-length = 88
+target-version = "py312"
+src = ["src"]
+
+# Enable auto-fixing
+fix = true
+
+[tool.ruff.lint]
+# Select common rule sets
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes
+    "I",   # isort
+    "N",   # pep8-naming
+    "UP",  # pyupgrade
+    "B",   # flake8-bugbear
+    "SIM", # flake8-simplify
+    "RUF", # Ruff-specific rules
+]
+
+# Ignore specific rules
+ignore = [
+    "E501", # line-too-long (handled by formatter)
+    "B008", # function-call-in-default-argument
+]
+
+# Allow fix for all enabled rules when using `--fix`
+fixable = ["ALL"]
+unfixable = []
+
+[tool.ruff.format]
+# Use double quotes for strings
+quote-style = "double"
+
+# Indent with spaces
+indent-style = "space"
+
+# Use Unix-style line endings
+line-ending = "auto"
+
+[tool.ruff.lint.isort]
+# Configure import sorting
+known-first-party = ["h_net_jax"]
