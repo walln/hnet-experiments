@@ -35,7 +35,7 @@ def apply_rotary_emb_jax(
         Tensor with rotary embeddings applied
     """
     ro_dim = cos.shape[-1] * 2
-    assert ro_dim <= x.shape[-1]
+    assert ro_dim <= x.shape[-1], f"Rotary dim {ro_dim} exceeds head dim {x.shape[-1]}"
 
     # Repeat cos and sin to match x's shape
     cos = repeat(
