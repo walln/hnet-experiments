@@ -6,8 +6,9 @@ import jax.numpy as jnp
 import pytest
 
 from hnet.modules.block import HybridBlock, Mamba2Wrapper
+from hnet.modules.cache import CacheState, create_mamba2_cache
+from hnet.modules.config import HybridConfig, Mamba2Config
 from hnet.modules.mamba2 import (
-    InferenceCache,
     Mamba2Block,
     Mamba2Layer,
     segsum,
@@ -96,7 +97,7 @@ def test_inference_cache():
     nheads = 8
     headdim = 16
 
-    cache = InferenceCache.alloc(batch_size, d_inner, d_state, d_conv, nheads, headdim)
+    cache = create_mamba2_cache(batch_size, d_inner, d_state, d_conv, nheads, headdim)
 
     assert cache.conv_state.shape == (batch_size, d_inner + 2 * d_state, d_conv)
     assert cache.ssm_state.shape == (batch_size, nheads, headdim, d_state)
@@ -138,7 +139,7 @@ def test_mamba2_layer():
     assert cache is None
 
     # Test with cache (for potential caching during training)
-    cache = InferenceCache.alloc(
+    cache = create_mamba2_cache(
         batch_size,
         mamba.d_inner,
         mamba.d_state,
@@ -172,7 +173,7 @@ def test_mamba2_inference_step():
     )
 
     # Initialize cache
-    cache = InferenceCache.alloc(
+    cache = create_mamba2_cache(
         batch_size,
         mamba.d_inner,
         mamba.d_state,
@@ -205,8 +206,8 @@ def test_mamba2_block():
     seq_len = 64
     chunk_size = 16
 
-    # Create module
-    block = Mamba2Block(
+    # Create config
+    config = Mamba2Config(
         d_model=d_model,
         d_state=16,
         d_conv=4,
@@ -215,6 +216,11 @@ def test_mamba2_block():
         ngroups=1,
         chunk_size=chunk_size,
         layer_idx=0,
+    )
+
+    # Create module
+    block = Mamba2Block(
+        config=config,
         rngs=rngs,
     )
 
@@ -240,17 +246,28 @@ def test_hybrid_block_mamba():
     batch_size = 2
     seq_len = 16
 
-    # Create module with Mamba2
-    block = HybridBlock(
+    # Create config with Mamba2
+    mamba_config = Mamba2Config(
+        d_model=d_model,
+        d_state=16,
+        d_conv=4,
+        expand=2,
+        chunk_size=8,  # Use appropriate chunk size for seq_len
+        layer_idx=0,
+    )
+
+    config = HybridConfig(
         d_model=d_model,
         n_heads=8,  # Not used when use_mamba=True
         use_mamba=True,
-        d_state=16,
-        d_conv=4,
-        expand_factor=2,
         mlp_expand=4,
         layer_idx=0,
-        chunk_size=8,  # Use appropriate chunk size for seq_len
+        mamba_config=mamba_config,
+    )
+
+    # Create module with Mamba2
+    block = HybridBlock(
+        config=config,
         rngs=rngs,
     )
 
@@ -258,10 +275,11 @@ def test_hybrid_block_mamba():
     x = jax.random.normal(rngs(), (batch_size, seq_len, d_model))
 
     # Forward pass
-    output = block(x)
+    output, cache = block(x)
 
     # Check output shape
     assert output.shape == x.shape
+    assert cache is None
 
 
 def test_hybrid_block_attention():
@@ -271,12 +289,26 @@ def test_hybrid_block_attention():
     batch_size = 2
     seq_len = 16
 
-    # Create module with Attention
-    block = HybridBlock(
+    # Create config with Attention
+    from hnet.modules.config import AttentionConfig
+
+    attention_config = AttentionConfig(
+        d_model=d_model,
+        num_heads=8,
+        layer_idx=0,
+    )
+
+    config = HybridConfig(
         d_model=d_model,
         n_heads=8,
         use_mamba=False,
         layer_idx=0,
+        attention_config=attention_config,
+    )
+
+    # Create module with Attention
+    block = HybridBlock(
+        config=config,
         rngs=rngs,
     )
 
@@ -284,10 +316,11 @@ def test_hybrid_block_attention():
     x = jax.random.normal(rngs(), (batch_size, seq_len, d_model))
 
     # Forward pass
-    output = block(x)
+    output, cache = block(x)
 
     # Check output shape
     assert output.shape == x.shape
+    assert cache is None
 
 
 def test_mamba2_wrapper():
@@ -297,14 +330,19 @@ def test_mamba2_wrapper():
     batch_size = 2
     seq_len = 16
 
-    # Create module
-    wrapper = Mamba2Wrapper(
+    # Create config
+    config = Mamba2Config(
         d_model=d_model,
         d_state=16,
         d_conv=4,
         expand=2,
         layer_idx=0,
         chunk_size=8,  # Use appropriate chunk size for seq_len
+    )
+
+    # Create module
+    wrapper = Mamba2Wrapper(
+        config=config,
         rngs=rngs,
     )
 
@@ -312,16 +350,18 @@ def test_mamba2_wrapper():
     x = jax.random.normal(rngs(), (batch_size, seq_len, d_model))
 
     # Forward pass
-    output = wrapper(x)
+    output, cache = wrapper(x)
 
     # Check output shape
     assert output.shape == x.shape
+    assert cache is None
 
     # Test step method for generation
     single_token = jax.random.normal(rngs(), (batch_size, 1, d_model))
-    inference_params = {}
-    step_output = wrapper.step(single_token, inference_params)
+    cache_state = CacheState.empty()
+    step_output, updated_cache = wrapper.step(single_token, cache_state)
     assert step_output.shape == single_token.shape
+    assert updated_cache is not None
 
 
 @pytest.mark.parametrize(
@@ -376,7 +416,7 @@ def test_mamba2_convolution():
     assert conv_out.shape == x.shape
 
     # Test inference mode convolution
-    cache = InferenceCache.alloc(
+    cache = create_mamba2_cache(
         batch_size,
         mamba.d_inner,
         mamba.d_state,

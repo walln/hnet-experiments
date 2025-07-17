@@ -5,8 +5,10 @@
 import flax.nnx as nnx
 import jax
 
+from hnet.modules.cache import CacheState, create_mamba2_cache
+from hnet.modules.config import HybridConfig, Mamba2Config
 from hnet.modules.mamba2 import Mamba2Block
-from hnet.modules.mha import CausalMHA, InferenceParams
+from hnet.modules.mha import CausalMHA
 from hnet.modules.swiglu import SwiGLU
 
 
@@ -21,17 +23,7 @@ class HybridBlock(nnx.Module):
 
     def __init__(
         self,
-        d_model: int,
-        n_heads: int,
-        use_mamba: bool = True,
-        d_state: int = 128,
-        d_conv: int = 4,
-        expand_factor: int = 2,
-        mlp_expand: int = 4,
-        layer_idx: int | None = None,
-        norm_epsilon: float = 1e-5,
-        window_size: int = -1,
-        chunk_size: int = 256,
+        config: HybridConfig,
         *,
         rngs: nnx.Rngs,
     ):
@@ -39,55 +31,37 @@ class HybridBlock(nnx.Module):
         Initialize hybrid block.
 
         Args:
-            d_model: Model dimension
-            n_heads: Number of attention heads (if using attention)
-            use_mamba: Whether to use Mamba2 (True) or Attention (False)
-            d_state: SSM state dimension (for Mamba2)
-            d_conv: Convolution kernel size (for Mamba2)
-            expand_factor: Expansion factor for Mamba2 inner dimension
-            mlp_expand: Expansion factor for MLP
-            layer_idx: Layer index for caching
-            norm_epsilon: Epsilon for layer normalization
-            window_size: Window size for attention (-1 for global)
-            chunk_size: Chunk size for Mamba2 SSD algorithm
+            config: Hybrid block configuration
             rngs: Random number generators
         """
-        self.use_mamba = use_mamba
-        self.layer_idx = layer_idx
+        self.config = config
+        self.use_mamba = config.use_mamba
+        self.layer_idx = config.layer_idx
 
         # Pre-norm for sequence mixing
-        self.norm1 = nnx.RMSNorm(d_model, epsilon=norm_epsilon, rngs=rngs)
+        self.norm1 = nnx.RMSNorm(config.d_model, epsilon=config.norm_epsilon, rngs=rngs)
 
         # Sequence mixing layer
-        if use_mamba:
+        if config.use_mamba:
+            assert config.mamba_config is not None
             self.mixer = Mamba2Block(
-                d_model=d_model,
-                d_state=d_state,
-                d_conv=d_conv,
-                expand=expand_factor,
-                headdim=64,  # Default head dimension
-                ngroups=1,  # Default number of groups
-                layer_idx=layer_idx,
-                norm_epsilon=norm_epsilon,
-                chunk_size=chunk_size,
+                config=config.mamba_config,
                 rngs=rngs,
             )
         else:
+            assert config.attention_config is not None
             self.mixer = CausalMHA(
-                d_model=d_model,
-                num_heads=n_heads,
-                window_size=window_size,
-                layer_idx=layer_idx,
+                config=config.attention_config,
                 rngs=rngs,
             )
 
         # Pre-norm for MLP
-        self.norm2 = nnx.RMSNorm(d_model, epsilon=norm_epsilon, rngs=rngs)
+        self.norm2 = nnx.RMSNorm(config.d_model, epsilon=config.norm_epsilon, rngs=rngs)
 
         # MLP
-        d_intermediate = d_model * mlp_expand
+        d_intermediate = config.d_model * config.mlp_expand
         self.mlp = SwiGLU(
-            d_model=d_model,
+            d_model=config.d_model,
             d_intermediate=d_intermediate,
             rngs=rngs,
         )
@@ -95,17 +69,18 @@ class HybridBlock(nnx.Module):
     def __call__(
         self,
         x: jax.Array,
-        inference_params: dict | None = None,
-    ) -> jax.Array:
+        cache: CacheState | None = None,
+    ) -> tuple[jax.Array, CacheState | None]:
         """
         Forward pass of hybrid block.
 
         Args:
             x: Input tensor of shape (batch, seq_len, d_model)
-            inference_params: Optional params for inference mode
+            cache: Optional cache state for inference mode
 
         Returns:
-            Output tensor of shape (batch, seq_len, d_model)
+            output: Output tensor of shape (batch, seq_len, d_model)
+            updated_cache: Updated cache state (if cache was provided)
         """
         # Sequence mixing with residual
         residual = x
@@ -113,25 +88,38 @@ class HybridBlock(nnx.Module):
 
         # Use isinstance to help the type checker
         if isinstance(self.mixer, Mamba2Block):
-            # Mamba2Block expects cache argument and returns a tuple
-            x, _ = self.mixer(x, cache=None)
-        elif isinstance(self.mixer, CausalMHA):
-            # CausalMHA expects InferenceParams object
-            # Convert dict to InferenceParams for attention
-            ip = None
-            if inference_params is not None and isinstance(inference_params, dict):
-                # Create InferenceParams from dict
-                ip = InferenceParams(
-                    max_batch_size=x.shape[0],
-                    max_seqlen=x.shape[1],
-                )
-                if "key_value_memory_dict" in inference_params:
-                    ip.key_value_memory_dict = inference_params["key_value_memory_dict"]
-            elif inference_params is not None:
-                ip = inference_params
+            # Get Mamba cache for this layer if available
+            mamba_cache = (
+                cache.get_mamba(self.layer_idx)
+                if cache and self.layer_idx is not None
+                else None
+            )
+            x, updated_mamba_cache = self.mixer(x, cache=mamba_cache)
 
-            # Call CausalMHA with proper parameters
-            x = self.mixer(x, inference_params=ip)
+            # Update cache if needed
+            if (
+                cache is not None
+                and updated_mamba_cache is not None
+                and self.layer_idx is not None
+            ):
+                cache = cache.update_mamba(self.layer_idx, updated_mamba_cache)
+
+        elif isinstance(self.mixer, CausalMHA):
+            # Get attention cache for this layer if available
+            attn_cache = (
+                cache.get_attention(self.layer_idx)
+                if cache and self.layer_idx is not None
+                else None
+            )
+            x, updated_attn_cache = self.mixer(x, cache=attn_cache)
+
+            # Update cache if needed
+            if (
+                cache is not None
+                and updated_attn_cache is not None
+                and self.layer_idx is not None
+            ):
+                cache = cache.update_attention(self.layer_idx, updated_attn_cache)
         else:
             raise ValueError(f"Unknown mixer type: {type(self.mixer)}")
 
@@ -143,7 +131,7 @@ class HybridBlock(nnx.Module):
         x = self.mlp(x)
         x = residual + x
 
-        return x
+        return x, cache
 
 
 class Mamba2Wrapper(nnx.Module):
@@ -155,46 +143,51 @@ class Mamba2Wrapper(nnx.Module):
 
     def __init__(
         self,
-        d_model: int,
-        d_state: int = 128,
-        d_conv: int = 4,
-        expand: int = 2,
-        layer_idx: int | None = None,
-        chunk_size: int = 256,
+        config: Mamba2Config,
         *,
         rngs: nnx.Rngs,
     ):
         """Initialize Mamba2 wrapper."""
-        self.layer_idx = layer_idx
+        self.config = config
+        self.layer_idx = config.layer_idx
         self.mamba = Mamba2Block(
-            d_model=d_model,
-            d_state=d_state,
-            d_conv=d_conv,
-            expand=expand,
-            chunk_size=chunk_size,
-            headdim=64,  # Default head dimension
-            ngroups=1,  # Default number of groups
-            layer_idx=layer_idx,
+            config=config,
             rngs=rngs,
         )
 
-    def __call__(self, x: jax.Array, inference_params: dict | None = None) -> jax.Array:
+    def __call__(
+        self, x: jax.Array, cache: CacheState | None = None
+    ) -> tuple[jax.Array, CacheState | None]:
         """Forward pass through wrapped Mamba2Block."""
-        # Mamba2Block returns tuple, extract just the output
-        output, _ = self.mamba(x, cache=None)
-        return output
+        # Get Mamba cache for this layer if available
+        mamba_cache = (
+            cache.get_mamba(self.layer_idx)
+            if cache and self.layer_idx is not None
+            else None
+        )
+        output, updated_mamba_cache = self.mamba(x, cache=mamba_cache)
 
-    def step(self, x: jax.Array, inference_params: dict | None = None) -> jax.Array:
+        # Update cache if needed
+        if (
+            cache is not None
+            and updated_mamba_cache is not None
+            and self.layer_idx is not None
+        ):
+            cache = cache.update_mamba(self.layer_idx, updated_mamba_cache)
+
+        return output, cache
+
+    def step(self, x: jax.Array, cache: CacheState) -> tuple[jax.Array, CacheState]:
         """Single step for generation."""
-        if inference_params is None:
-            inference_params = {}
+        # Get or create Mamba cache for this layer
+        mamba_cache = (
+            cache.get_mamba(self.layer_idx) if self.layer_idx is not None else None
+        )
 
-        # Initialize cache if not present
-        if "cache" not in inference_params:
-            from .mamba2 import InferenceCache
-
+        if mamba_cache is None and self.layer_idx is not None:
+            # Initialize cache if not present
             batch_size = x.shape[0]
-            inference_params["cache"] = InferenceCache.alloc(
+            mamba_cache = create_mamba2_cache(
                 batch_size,
                 self.mamba.mamba.d_inner,
                 self.mamba.mamba.d_state,
@@ -202,11 +195,13 @@ class Mamba2Wrapper(nnx.Module):
                 self.mamba.mamba.nheads,
                 self.mamba.mamba.headdim,
             )
+            cache = cache.update_mamba(self.layer_idx, mamba_cache)
 
         # Call Mamba2Block with cache
-        output, updated_cache = self.mamba(x, cache=inference_params["cache"])
+        output, updated_cache = self.mamba(x, cache=mamba_cache)
 
-        # Update cache in params
-        inference_params["cache"] = updated_cache
+        # Update cache if needed
+        if updated_cache is not None and self.layer_idx is not None:
+            cache = cache.update_mamba(self.layer_idx, updated_cache)
 
-        return output
+        return output, cache

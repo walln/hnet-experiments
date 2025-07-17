@@ -1,13 +1,13 @@
 # Copyright (c) 2025, Nick Wall.
 # JAX implementation of Mamba2 (State Space Model)
 # Based on the original implementation by Tri Dao and Albert Gu
-
-from dataclasses import dataclass
-
 import flax.nnx as nnx
 import jax
 import jax.numpy as jnp
 from einops import rearrange, repeat
+
+from .cache import Mamba2CacheState
+from .config import Mamba2Config
 
 
 def softplus(x: jax.Array) -> jax.Array:
@@ -20,26 +20,8 @@ def silu(x: jax.Array) -> jax.Array:
     return x * jax.nn.sigmoid(x)
 
 
-@dataclass
-class InferenceCache:
-    """Cache for autoregressive inference."""
-
-    conv_state: jax.Array  # (batch, d_inner + 2 * d_state, d_conv)
-    ssm_state: jax.Array  # (batch, nheads, headdim, d_state)
-
-    @staticmethod
-    def alloc(
-        batch_size: int,
-        d_inner: int,
-        d_state: int,
-        d_conv: int,
-        nheads: int,
-        headdim: int,
-    ) -> "InferenceCache":
-        """Allocate a new inference cache."""
-        conv_state = jnp.zeros((batch_size, d_inner + 2 * d_state, d_conv))
-        ssm_state = jnp.zeros((batch_size, nheads, headdim, d_state))
-        return InferenceCache(conv_state, ssm_state)
+# For backward compatibility, alias the new cache structure
+InferenceCache = Mamba2CacheState
 
 
 def segsum(x: jax.Array) -> jax.Array:
@@ -539,35 +521,37 @@ class Mamba2Block(nnx.Module):
 
     def __init__(
         self,
-        d_model: int,
-        d_state: int = 128,
-        d_conv: int = 4,
-        expand: int = 2,
-        headdim: int = 64,
-        ngroups: int = 1,
-        layer_idx: int | None = None,
-        norm_epsilon: float = 1e-5,
-        chunk_size: int = 256,
+        config: Mamba2Config,
         *,
         rngs: nnx.Rngs,
     ):
         """Initialize Mamba2 block with norm and residual."""
-        self.norm = nnx.RMSNorm(d_model, epsilon=norm_epsilon, rngs=rngs)
+        self.config = config
+        self.norm = nnx.RMSNorm(config.d_model, epsilon=config.norm_epsilon, rngs=rngs)
         self.mamba = Mamba2Layer(
-            d_model=d_model,
-            d_state=d_state,
-            d_conv=d_conv,
-            expand=expand,
-            headdim=headdim,
-            ngroups=ngroups,
-            chunk_size=chunk_size,
-            layer_idx=layer_idx,
+            d_model=config.d_model,
+            d_state=config.d_state,
+            d_conv=config.d_conv,
+            expand=config.expand,
+            headdim=config.headdim,
+            ngroups=config.ngroups,
+            chunk_size=config.chunk_size,
+            layer_idx=config.layer_idx,
+            A_init_range=config.A_init_range,
+            D_has_hdim=config.D_has_hdim,
+            rmsnorm=config.rmsnorm,
+            norm_before_gate=config.norm_before_gate,
+            dt_min=config.dt_min,
+            dt_max=config.dt_max,
+            dt_init_floor=config.dt_init_floor,
+            bias=config.bias,
+            conv_bias=config.conv_bias,
             rngs=rngs,
         )
 
     def __call__(
-        self, x: jax.Array, cache: InferenceCache | None = None
-    ) -> tuple[jax.Array, InferenceCache | None]:
+        self, x: jax.Array, cache: Mamba2CacheState | None = None
+    ) -> tuple[jax.Array, Mamba2CacheState | None]:
         """Forward pass with residual connection."""
         residual = x
         x = self.norm(x)

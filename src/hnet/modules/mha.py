@@ -7,7 +7,9 @@ import jax
 import jax.numpy as jnp
 from einops import rearrange
 
-from .rotary import RotaryEmbedding
+from hnet.modules.cache import AttentionCacheState
+from hnet.modules.config import AttentionConfig
+from hnet.modules.rotary import RotaryEmbedding
 
 
 def causal_mask(
@@ -262,16 +264,7 @@ class CausalMHA(nnx.Module):
 
     def __init__(
         self,
-        d_model: int,
-        num_heads: int,
-        qkv_proj_bias: bool = False,
-        out_proj_bias: bool = False,
-        window_size: int = -1,
-        softmax_scale: float | None = None,
-        layer_idx: int | None = None,
-        rotary_emb_dim: int = 0,
-        rotary_emb_base: float = 10000.0,
-        rotary_emb_interleaved: bool = False,
+        config: AttentionConfig,
         *,
         rngs: nnx.Rngs,
     ):
@@ -279,121 +272,74 @@ class CausalMHA(nnx.Module):
         Initialize Causal MHA.
 
         Args:
-            d_model: Model dimension
-            num_heads: Number of attention heads
-            qkv_proj_bias: Whether to use bias in QKV projection
-            out_proj_bias: Whether to use bias in output projection
-            window_size: Sliding window size (-1 for global attention)
-            softmax_scale: Attention scaling factor
-            layer_idx: Layer index (for KV caching)
-            rotary_emb_dim: Dimension of rotary embeddings (0 to disable)
-            rotary_emb_base: Base for rotary embeddings
-            rotary_emb_interleaved: Whether to use interleaved rotary
+            config: Attention configuration
             rngs: Random number generators
         """
-        self.d_model = d_model
-        self.num_heads = num_heads
-        self.layer_idx = layer_idx
-        self.softmax_scale = softmax_scale
-        self.rotary_emb_dim = rotary_emb_dim
+        self.config = config
+        self.d_model = config.d_model
+        self.num_heads = config.num_heads
+        self.layer_idx = config.layer_idx
+        self.softmax_scale = config.softmax_scale
+        self.rotary_emb_dim = config.rotary_emb_dim
 
-        assert d_model % num_heads == 0, "d_model must be divisible by num_heads"
-        self.head_dim = d_model // num_heads
+        assert config.d_model % config.num_heads == 0, (
+            "d_model must be divisible by num_heads"
+        )
+        self.head_dim = config.d_model // config.num_heads
         qkv_dim = self.head_dim * (3 * self.num_heads)
 
         # Initialize rotary embeddings if needed
         if self.rotary_emb_dim > 0:
             self.rotary_emb = RotaryEmbedding(
-                dim=rotary_emb_dim,
-                base=rotary_emb_base,
-                interleaved=rotary_emb_interleaved,
+                dim=config.rotary_emb_dim,
+                base=config.rotary_emb_base,
+                interleaved=config.rotary_emb_interleaved,
                 rngs=rngs,
             )
         else:
             self.rotary_emb = None
 
         # Initialize linear layers
-        self.Wqkv = nnx.Linear(d_model, qkv_dim, use_bias=qkv_proj_bias, rngs=rngs)
+        self.Wqkv = nnx.Linear(
+            config.d_model, qkv_dim, use_bias=config.qkv_proj_bias, rngs=rngs
+        )
 
         # Initialize attention modules
         self.inner_attn = CausalSelfAttention(
-            softmax_scale=softmax_scale,
-            window_size=(window_size, -1),
+            softmax_scale=config.softmax_scale,
+            window_size=(config.window_size, -1),
             rngs=rngs,
         )
         self.inner_cross_attn = CausalCrossAttention(
-            softmax_scale=softmax_scale,
-            window_size=(window_size, -1),
+            softmax_scale=config.softmax_scale,
+            window_size=(config.window_size, -1),
             rngs=rngs,
         )
 
-        self.out_proj = nnx.Linear(d_model, d_model, use_bias=out_proj_bias, rngs=rngs)
-
-        # For KV caching - initialize with empty array instead of None
-        self._kv_cache = nnx.Variable(jnp.zeros((0, 0, 0, 0, 0), dtype=jnp.float32))
-
-    def allocate_inference_cache(
-        self, batch_size: int, max_seqlen: int, dtype=None
-    ) -> jax.Array:
-        """Allocate KV cache for inference."""
-        if dtype is None:
-            dtype = self.out_proj.kernel.value.dtype
-
-        cache = jnp.zeros(
-            (batch_size, max_seqlen, 2, self.num_heads, self.head_dim),
-            dtype=dtype,
+        self.out_proj = nnx.Linear(
+            config.d_model, config.d_model, use_bias=config.out_proj_bias, rngs=rngs
         )
-        self._kv_cache.value = cache
-        return cache
-
-    def _update_kv_cache(
-        self, kv: jax.Array, cache_position: int
-    ) -> tuple[jax.Array, jax.Array]:
-        """
-        Update KV cache and return updated cache.
-
-        Args:
-            kv: New KV values of shape (batch, seqlen, 2, nheads, head_dim)
-            cache_position: Position in cache to update
-
-        Returns:
-            Updated KV cache and the cache up to current position
-        """
-        if self._kv_cache.value.size == 0:
-            raise ValueError(
-                "KV cache not allocated. Call allocate_inference_cache first."
-            )
-
-        batch_size, seqlen, _, _, _ = kv.shape
-
-        # Update cache
-        new_cache = self._kv_cache.value.at[
-            :batch_size, cache_position : cache_position + seqlen
-        ].set(kv)
-        self._kv_cache.value = new_cache
-
-        # Return cache up to current position
-        return new_cache, new_cache[:batch_size, : cache_position + seqlen]
 
     def __call__(
         self,
         x: jax.Array,
+        cache: AttentionCacheState | None = None,
         cu_seqlens: jax.Array | None = None,
         max_seqlen: int | None = None,
-        inference_params: InferenceParams | None = None,
         **kwargs,
-    ) -> jax.Array:
+    ) -> tuple[jax.Array, AttentionCacheState | None]:
         """
         Forward pass of Causal MHA.
 
         Args:
             x: Input tensor of shape (batch, seqlen, d_model)
+            cache: Optional attention cache state
             cu_seqlens: Not yet supported
             max_seqlen: Not yet supported
-            inference_params: Parameters for inference mode with KV caching
 
         Returns:
-            Output tensor of shape (batch, seqlen, d_model)
+            output: Output tensor of shape (batch, seqlen, d_model)
+            updated_cache: Updated cache state (if cache was provided)
         """
         if cu_seqlens is not None:
             raise NotImplementedError(
@@ -410,21 +356,43 @@ class CausalMHA(nnx.Module):
 
         # Apply rotary embeddings if enabled
         if self.rotary_emb is not None:
-            if inference_params is not None:
-                seqlen_offset = inference_params.seqlen_offset
-            else:
-                seqlen_offset = 0
+            seqlen_offset = cache.cached_len if cache is not None else 0
             qkv = self.rotary_emb(qkv, seqlen_offset=seqlen_offset)
 
         # Handle inference mode with KV caching
-        if inference_params is not None and inference_params.seqlen_offset > 0:
+        if cache is not None and cache.cached_len > 0:
             # We're in generation mode
             assert isinstance(qkv, jax.Array), "qkv must be a JAX array"
             q = qkv[:, :, 0]  # (batch, seqlen, nheads, head_dim)
             kv_new = qkv[:, :, 1:]  # (batch, seqlen, 2, nheads, head_dim)
 
             # Update KV cache
-            _, kv_cache = self._update_kv_cache(kv_new, inference_params.seqlen_offset)
+            k_new = kv_new[:, :, 0]  # (batch, seqlen, nheads, head_dim)
+            v_new = kv_new[:, :, 1]  # (batch, seqlen, nheads, head_dim)
+
+            # Update cache arrays
+            new_k_cache = cache.key_cache.at[
+                :batch_size, cache.cached_len : cache.cached_len + seqlen
+            ].set(k_new)
+            new_v_cache = cache.value_cache.at[
+                :batch_size, cache.cached_len : cache.cached_len + seqlen
+            ].set(v_new)
+
+            # Create updated cache state
+            updated_cache = AttentionCacheState(
+                key_cache=new_k_cache,
+                value_cache=new_v_cache,
+                cached_len=cache.cached_len + seqlen,
+            )
+
+            # Get cached KV up to current position
+            kv_cache = jnp.stack(
+                [
+                    updated_cache.key_cache[:batch_size, : updated_cache.cached_len],
+                    updated_cache.value_cache[:batch_size, : updated_cache.cached_len],
+                ],
+                axis=2,
+            )
 
             # Cross attention with cached KV
             context = self.inner_cross_attn(q, kv_cache)
@@ -433,11 +401,31 @@ class CausalMHA(nnx.Module):
             assert isinstance(qkv, jax.Array), "qkv must be a JAX array"
             context = self.inner_attn(qkv)
 
+            # If cache is provided but empty, initialize it
+            if cache is not None:
+                k = qkv[:, :, 1]  # (batch, seqlen, nheads, head_dim)
+                v = qkv[:, :, 2]  # (batch, seqlen, nheads, head_dim)
+
+                # Update cache arrays
+                new_k_cache = cache.key_cache.at[:batch_size, :seqlen].set(k)
+                new_v_cache = cache.value_cache.at[:batch_size, :seqlen].set(v)
+
+                updated_cache = AttentionCacheState(
+                    key_cache=new_k_cache, value_cache=new_v_cache, cached_len=seqlen
+                )
+            else:
+                updated_cache = None
+
         # Project output
         assert isinstance(context, jax.Array), "context must be a JAX array"
         out = self.out_proj(rearrange(context, "b s h d -> b s (h d)"))
-        return out
 
-    def step(self, x: jax.Array, inference_params: InferenceParams) -> jax.Array:
+        return out, updated_cache
+
+    def step(
+        self, x: jax.Array, cache: AttentionCacheState
+    ) -> tuple[jax.Array, AttentionCacheState]:
         """Single step for autoregressive generation."""
-        return self(x, inference_params=inference_params)
+        out, updated_cache = self(x, cache=cache)
+        assert updated_cache is not None, "Cache must be provided for step mode"
+        return out, updated_cache

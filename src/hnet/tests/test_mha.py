@@ -2,6 +2,8 @@ import flax.nnx as nnx
 import jax
 import jax.numpy as jnp
 
+from hnet.modules.cache import AttentionCacheState, create_attention_cache
+from hnet.modules.config import AttentionConfig
 from hnet.modules.mha import (
     CausalCrossAttention,
     CausalMHA,
@@ -162,12 +164,17 @@ def test_causal_mha_basic():
     d_model, num_heads = 256, 8
     batch_size, seq_len = 2, 16
 
-    # Initialize module
-    mha = CausalMHA(
+    # Create config
+    config = AttentionConfig(
         d_model=d_model,
         num_heads=num_heads,
         qkv_proj_bias=True,
         out_proj_bias=True,
+    )
+
+    # Initialize module
+    mha = CausalMHA(
+        config=config,
         rngs=rngs,
     )
 
@@ -175,12 +182,14 @@ def test_causal_mha_basic():
     x = jax.random.normal(rngs(), (batch_size, seq_len, d_model))
 
     # Forward pass
-    output = mha(x)
+    output, cache = mha(x)
     assert output.shape == (batch_size, seq_len, d_model)
+    assert cache is None
 
     # Test gradient flow
     def loss_fn(x):
-        return jnp.sum(mha(x))
+        out, _ = mha(x)
+        return jnp.sum(out)
 
     grad_fn = jax.grad(loss_fn)
     grad = grad_fn(x)
@@ -195,13 +204,18 @@ def test_causal_mha_with_rotary():
     rotary_dim = 16
     batch_size, seq_len = 2, 16
 
-    # Initialize module with rotary embeddings
-    mha = CausalMHA(
+    # Create config with rotary embeddings
+    config = AttentionConfig(
         d_model=d_model,
         num_heads=num_heads,
         rotary_emb_dim=rotary_dim,
         rotary_emb_base=10000.0,
         rotary_emb_interleaved=False,
+    )
+
+    # Initialize module with rotary embeddings
+    mha = CausalMHA(
+        config=config,
         rngs=rngs,
     )
 
@@ -209,20 +223,26 @@ def test_causal_mha_with_rotary():
     x = jax.random.normal(rngs(), (batch_size, seq_len, d_model))
 
     # Forward pass
-    output = mha(x)
+    output, cache = mha(x)
     assert output.shape == (batch_size, seq_len, d_model)
+    assert cache is None
 
     # Test with interleaved rotary
-    mha_interleaved = CausalMHA(
+    config_interleaved = AttentionConfig(
         d_model=d_model,
         num_heads=num_heads,
         rotary_emb_dim=rotary_dim,
         rotary_emb_interleaved=True,
+    )
+
+    mha_interleaved = CausalMHA(
+        config=config_interleaved,
         rngs=rngs,
     )
 
-    output_interleaved = mha_interleaved(x)
+    output_interleaved, cache_interleaved = mha_interleaved(x)
     assert output_interleaved.shape == (batch_size, seq_len, d_model)
+    assert cache_interleaved is None
 
 
 def test_causal_mha_kv_cache():
@@ -231,41 +251,43 @@ def test_causal_mha_kv_cache():
     d_model, num_heads = 256, 8
     batch_size, max_seq_len = 2, 32
 
-    # Initialize module
-    mha = CausalMHA(
+    # Create config
+    config = AttentionConfig(
         d_model=d_model,
         num_heads=num_heads,
         layer_idx=0,  # Required for KV caching
+    )
+
+    # Initialize module
+    mha = CausalMHA(
+        config=config,
         rngs=rngs,
     )
 
-    # Allocate KV cache
-    mha.allocate_inference_cache(batch_size, max_seq_len)
-
-    # Test generation mode
-    inference_params = InferenceParams(
-        max_batch_size=batch_size,
-        max_seqlen=max_seq_len,
-        seqlen_offset=0,
-        batch_size_offset=0,
+    # Create KV cache
+    cache = create_attention_cache(
+        batch_size=batch_size,
+        max_seq_len=max_seq_len,
+        num_heads=num_heads,
+        head_dim=d_model // num_heads,
     )
 
     # Generate token by token
-    for _ in range(10):
+    for i in range(10):
         # Single token input
         x = jax.random.normal(rngs(), (batch_size, 1, d_model))
 
         # Forward pass with caching
-        output = mha(x, inference_params=inference_params)
+        output, cache = mha(x, cache=cache)
         assert output.shape == (batch_size, 1, d_model)
-
-        # Update sequence offset
-        inference_params.seqlen_offset += 1
+        assert cache is not None
+        assert cache.cached_len == i + 1
 
     # Test step method
     x = jax.random.normal(rngs(), (batch_size, 1, d_model))
-    output = mha.step(x, inference_params)
+    output, cache = mha.step(x, cache)
     assert output.shape == (batch_size, 1, d_model)
+    assert cache is not None
 
 
 def test_causal_mha_window_size():
@@ -276,16 +298,18 @@ def test_causal_mha_window_size():
     batch_size, seq_len = 2, 16
 
     # Initialize module with window size
-    mha = CausalMHA(
-        d_model=d_model, num_heads=num_heads, window_size=window_size, rngs=rngs
+    config = AttentionConfig(
+        d_model=d_model, num_heads=num_heads, window_size=window_size
     )
+    mha = CausalMHA(config=config, rngs=rngs)
 
     # Create input
     x = jax.random.normal(rngs(), (batch_size, seq_len, d_model))
 
     # Forward pass
-    output = mha(x)
+    output, cache = mha(x)
     assert output.shape == (batch_size, seq_len, d_model)
+    assert cache is None
 
 
 def test_causal_mha_shapes():
@@ -302,11 +326,13 @@ def test_causal_mha_shapes():
     ]
 
     for batch_size, seq_len in configs:
-        mha = CausalMHA(d_model=d_model, num_heads=num_heads, rngs=rngs)
+        config = AttentionConfig(d_model=d_model, num_heads=num_heads)
+        mha = CausalMHA(config=config, rngs=rngs)
 
         x = jax.random.normal(rngs(), (batch_size, seq_len, d_model))
-        output = mha(x)
+        output, cache = mha(x)
         assert output.shape == (batch_size, seq_len, d_model)
+        assert cache is None
 
 
 def test_causal_mha_dtypes():
@@ -316,11 +342,13 @@ def test_causal_mha_dtypes():
     batch_size, seq_len = 2, 8
 
     for dtype in [jnp.float32, jnp.float16, jnp.bfloat16]:
-        mha = CausalMHA(d_model=d_model, num_heads=num_heads, rngs=rngs)
+        config = AttentionConfig(d_model=d_model, num_heads=num_heads)
+        mha = CausalMHA(config=config, rngs=rngs)
 
         x = jax.random.normal(rngs(), (batch_size, seq_len, d_model), dtype=dtype)
-        output = mha(x)
+        output, cache = mha(x)
         assert output.shape == (batch_size, seq_len, d_model)
+        assert cache is None
         # Linear layers may cast to float32 for numerical stability
         # So we only check that the output is a floating type
         assert jnp.issubdtype(output.dtype, jnp.floating)
@@ -333,7 +361,8 @@ def test_causal_mha_jit():
     batch_size, seq_len = 2, 8
 
     # Initialize module
-    mha = CausalMHA(d_model=d_model, num_heads=num_heads, rngs=rngs)
+    config = AttentionConfig(d_model=d_model, num_heads=num_heads)
+    mha = CausalMHA(config=config, rngs=rngs)
 
     # Create JIT-compiled forward function using nnx.jit
     @nnx.jit
@@ -342,8 +371,9 @@ def test_causal_mha_jit():
 
     # Test forward pass
     x = jax.random.normal(rngs(), (batch_size, seq_len, d_model))
-    output = forward(mha, x)
+    output, cache = forward(mha, x)
     assert output.shape == (batch_size, seq_len, d_model)
+    assert cache is None
 
 
 def test_causal_mha_vmap():
@@ -353,7 +383,8 @@ def test_causal_mha_vmap():
     num_examples, batch_size, seq_len = 3, 2, 8
 
     # Initialize module
-    mha = CausalMHA(d_model=d_model, num_heads=num_heads, rngs=rngs)
+    config = AttentionConfig(d_model=d_model, num_heads=num_heads)
+    mha = CausalMHA(config=config, rngs=rngs)
 
     # Create vmapped forward function
     @nnx.vmap(in_axes=(None, 0), out_axes=0)
@@ -362,8 +393,11 @@ def test_causal_mha_vmap():
 
     # Test forward pass
     x = jax.random.normal(rngs(), (num_examples, batch_size, seq_len, d_model))
-    output = forward(mha, x)
+    output, cache = forward(mha, x)
     assert output.shape == (num_examples, batch_size, seq_len, d_model)
+    assert cache is None or (
+        isinstance(cache, AttentionCacheState) and cache.cached_len == 0
+    )
 
 
 def test_inference_params():
