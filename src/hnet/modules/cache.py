@@ -1,6 +1,4 @@
-"""Unified cache structures for JAX-idiomatic inference."""
-
-from dataclasses import dataclass
+    from dataclasses import dataclass
 
 import jax
 import jax.numpy as jnp

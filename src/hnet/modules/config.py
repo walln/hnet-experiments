@@ -1,5 +1,3 @@
-"""Configuration dataclasses for H-Net modules."""
-
 from dataclasses import dataclass
 
 import jax.numpy as jnp
@@ -89,3 +87,56 @@ class MLPConfig:
     bias: bool = False
     multiple_of: int = 128
     dtype: jnp.dtype | None = None
+
+
+@dataclass
+class AttnConfig:
+    """Configuration for attention in H-Net."""
+
+    num_heads: list[int] | None = None
+    rotary_emb_dim: list[int] | None = None
+    window_size: list[int] | None = None
+
+    def __post_init__(self):
+        if self.num_heads is None:
+            self.num_heads = []
+        if self.rotary_emb_dim is None:
+            self.rotary_emb_dim = []
+        if self.window_size is None:
+            self.window_size = []
+
+
+@dataclass
+class SSMConfig:
+    """Configuration for SSM (State Space Model) in H-Net."""
+
+    d_conv: int = 4
+    expand: int = 2
+    d_state: int = 128
+    chunk_size: int = 256
+
+
+@dataclass
+class HNetConfig:
+    """Configuration for H-Net model."""
+
+    arch_layout: list[str | list] | None = None
+    d_model: list[int] | None = None
+    # intermediate dimension for the FFNs (0 indicates no FFN)
+    d_intermediate: list[int] | None = None
+    vocab_size: int = 256
+    ssm_cfg: SSMConfig | None = None
+    attn_cfg: AttnConfig | None = None
+    tie_embeddings: bool = False
+
+    def __post_init__(self):
+        if self.arch_layout is None:
+            self.arch_layout = []
+        if self.d_model is None:
+            self.d_model = []
+        if self.d_intermediate is None:
+            self.d_intermediate = []
+        if self.ssm_cfg is None:
+            self.ssm_cfg = SSMConfig()
+        if self.attn_cfg is None:
+            self.attn_cfg = AttnConfig()

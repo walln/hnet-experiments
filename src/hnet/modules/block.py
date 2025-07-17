@@ -1,12 +1,17 @@
 # Copyright (c) 2025, Nick Wall.
 # JAX implementation of hybrid transformer blocks combining Mamba2 and attention
 
-
 import flax.nnx as nnx
 import jax
 
 from hnet.modules.cache import CacheState, create_mamba2_cache
-from hnet.modules.config import HybridConfig, Mamba2Config
+from hnet.modules.config import (
+    AttentionConfig,
+    AttnConfig,
+    HybridConfig,
+    Mamba2Config,
+    SSMConfig,
+)
 from hnet.modules.mamba2 import Mamba2Block
 from hnet.modules.mha import CausalMHA
 from hnet.modules.swiglu import SwiGLU
@@ -205,3 +210,94 @@ class Mamba2Wrapper(nnx.Module):
             cache = cache.update_mamba(self.layer_idx, updated_cache)
 
         return output, cache
+
+
+def create_block(
+    arch: str,
+    d_model: int,
+    d_intermediate: int,
+    ssm_cfg: SSMConfig,
+    attn_cfg: AttnConfig,
+    layer_idx: int,
+    rngs: nnx.Rngs,
+) -> HybridBlock:
+    """
+    Create a hybrid block based on architecture string.
+
+    Args:
+        arch: Architecture type - 'm'/'M' for Mamba2, 't'/'T' for Transformer/MHA
+        d_model: Model dimension
+        d_intermediate: Intermediate dimension for FFN
+        ssm_cfg: SSM configuration
+        attn_cfg: Attention configuration
+        layer_idx: Layer index
+        rngs: Random number generators
+        **kwargs: Additional arguments (for compatibility)
+
+    Returns:
+        HybridBlock instance
+    """
+    use_mamba = arch in ("m", "M")
+
+    if use_mamba:
+        # Create Mamba2Config from SSMConfig
+        mamba_config = Mamba2Config(
+            d_model=d_model,
+            d_state=ssm_cfg.d_state,
+            d_conv=ssm_cfg.d_conv,
+            expand=ssm_cfg.expand,
+            chunk_size=ssm_cfg.chunk_size,
+            layer_idx=layer_idx,
+        )
+        config = HybridConfig(
+            d_model=d_model,
+            n_heads=0,  # Not used for Mamba
+            use_mamba=True,
+            mlp_expand=d_intermediate // d_model if d_intermediate > 0 else 0,
+            layer_idx=layer_idx,
+            mamba_config=mamba_config,
+        )
+    else:
+        # Create AttentionConfig from AttnConfig
+        # Note: attn_cfg values are already scalars after get_stage_cfg processing
+        # Handle both list and scalar cases for type safety
+        if isinstance(attn_cfg.num_heads, list):
+            num_heads = int(attn_cfg.num_heads[0]) if attn_cfg.num_heads else 8
+        else:
+            num_heads = int(attn_cfg.num_heads) if attn_cfg.num_heads is not None else 8
+
+        if isinstance(attn_cfg.rotary_emb_dim, list):
+            rotary_emb_dim = (
+                int(attn_cfg.rotary_emb_dim[0]) if attn_cfg.rotary_emb_dim else 0
+            )
+        else:
+            rotary_emb_dim = (
+                int(attn_cfg.rotary_emb_dim)
+                if attn_cfg.rotary_emb_dim is not None
+                else 0
+            )
+
+        if isinstance(attn_cfg.window_size, list):
+            window_size = int(attn_cfg.window_size[0]) if attn_cfg.window_size else -1
+        else:
+            window_size = (
+                int(attn_cfg.window_size) if attn_cfg.window_size is not None else -1
+            )
+
+        attention_config = AttentionConfig(
+            d_model=d_model,
+            num_heads=num_heads,
+            layer_idx=layer_idx,
+            rotary_emb_dim=rotary_emb_dim,
+            window_size=window_size,
+        )
+        config = HybridConfig(
+            d_model=d_model,
+            n_heads=num_heads,
+            use_mamba=False,
+            mlp_expand=d_intermediate // d_model if d_intermediate > 0 else 0,
+            layer_idx=layer_idx,
+            attention_config=attention_config,
+        )
+
+    return HybridBlock(config=config, rngs=rngs)

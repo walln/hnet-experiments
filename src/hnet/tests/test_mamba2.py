@@ -1,5 +1,3 @@
-"""Tests for JAX Mamba2 implementation."""
-
 import flax.nnx as nnx
 import jax
 import jax.numpy as jnp
