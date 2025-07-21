@@ -3,7 +3,7 @@ import jax
 import jax.numpy as jnp
 import pytest
 
-from hnet.modules.config import AttnConfig, HNetConfig, SSMConfig
+from hnet.models.config_hnet import AttnConfig, HNetConfig, SSMConfig
 from hnet.modules.isotropic import Isotropic, IsotropicInferenceParams
 
 

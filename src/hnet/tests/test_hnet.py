@@ -5,8 +5,8 @@ import jax
 import jax.numpy as jnp
 import pytest
 
+from hnet.models.config_hnet import AttnConfig, SSMConfig
 from hnet.models.hnet import HNet, HNetConfig
-from hnet.modules.config import AttnConfig, SSMConfig
 
 
 @pytest.fixture
@@ -21,7 +21,7 @@ def simple_config():
             d_conv=4,
             expand=2,
             d_state=16,
-            chunk_size=1,  # Small chunk size for single-token tests
+            chunk_size=64,  # Use default chunk size
         ),
         attn_cfg=AttnConfig(
             num_heads=[8],
@@ -43,7 +43,7 @@ def hierarchical_config():
             d_conv=4,
             expand=2,
             d_state=16,
-            chunk_size=8,  # Smaller chunk size that divides common test sequence lengths
+            chunk_size=16,  # Use chunk size that divides test sequence lengths well
         ),
         attn_cfg=AttnConfig(
             num_heads=[4, 8],
@@ -69,8 +69,8 @@ def test_hnet_forward_pass(simple_config):
     rngs = nnx.Rngs(0)
     model = HNet(simple_config, stage_idx=0, rngs=rngs)
 
-    # Create dummy input
-    batch_size, seq_len = 2, 64
+    # Create dummy input with length divisible by chunk_size
+    batch_size, seq_len = 2, 128  # Divisible by default chunk_size=64
     hidden_states = jax.random.normal(
         jax.random.key(0), (batch_size, seq_len, simple_config.d_model[0])
     )
@@ -136,8 +136,8 @@ def test_hierarchical_hnet_forward(hierarchical_config):
     rngs = nnx.Rngs(42)
     model = HNet(hierarchical_config, stage_idx=0, rngs=rngs)
 
-    # Create dummy input
-    batch_size, seq_len = 1, 32
+    # Create dummy input with length divisible by chunk_size
+    batch_size, seq_len = 1, 48  # Divisible by chunk_size=16
     hidden_states = jax.random.normal(
         jax.random.key(2), (batch_size, seq_len, hierarchical_config.d_model[0])
     )

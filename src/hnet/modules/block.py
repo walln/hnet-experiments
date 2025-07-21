@@ -4,13 +4,12 @@
 import flax.nnx as nnx
 import jax
 
+from hnet.models.config_hnet import AttnConfig, SSMConfig
 from hnet.modules.cache import CacheState, create_mamba2_cache
 from hnet.modules.config import (
     AttentionConfig,
-    AttnConfig,
     HybridConfig,
     Mamba2Config,
-    SSMConfig,
 )
 from hnet.modules.mamba2 import Mamba2Block
 from hnet.modules.mha import CausalMHA
@@ -61,15 +60,26 @@ class HybridBlock(nnx.Module):
             )
 
         # Pre-norm for MLP
-        self.norm2 = nnx.RMSNorm(config.d_model, epsilon=config.norm_epsilon, rngs=rngs)
+        if config.mlp_expand > 0 or (
+            config.d_intermediate and config.d_intermediate > 0
+        ):
+            self.norm2 = nnx.RMSNorm(
+                config.d_model, epsilon=config.norm_epsilon, rngs=rngs
+            )
 
-        # MLP
-        d_intermediate = config.d_model * config.mlp_expand
-        self.mlp = SwiGLU(
-            d_model=config.d_model,
-            d_intermediate=d_intermediate,
-            rngs=rngs,
-        )
+            # MLP - use exact d_intermediate if provided, otherwise calculate from mlp_expand
+            if config.d_intermediate and config.d_intermediate > 0:
+                d_intermediate = config.d_intermediate
+            else:
+                d_intermediate = config.d_model * config.mlp_expand
+            self.mlp = SwiGLU(
+                d_model=config.d_model,
+                d_intermediate=d_intermediate,
+                rngs=rngs,
+            )
+        else:
+            self.norm2 = None
+            self.mlp = None
 
     def __call__(
         self,
@@ -130,11 +140,12 @@ class HybridBlock(nnx.Module):
 
         x = residual + x
 
-        # MLP with residual
-        residual = x
-        x = self.norm2(x)
-        x = self.mlp(x)
-        x = residual + x
+        # MLP with residual (if present)
+        if self.mlp is not None and self.norm2 is not None:
+            residual = x
+            x = self.norm2(x)
+            x = self.mlp(x)
+            x = residual + x
 
         return x, cache
 
@@ -254,6 +265,7 @@ def create_block(
             n_heads=0,  # Not used for Mamba
             use_mamba=True,
             mlp_expand=d_intermediate // d_model if d_intermediate > 0 else 0,
+            d_intermediate=d_intermediate if d_intermediate > 0 else None,
             layer_idx=layer_idx,
             mamba_config=mamba_config,
         )
@@ -296,6 +308,7 @@ def create_block(
             n_heads=num_heads,
             use_mamba=False,
             mlp_expand=d_intermediate // d_model if d_intermediate > 0 else 0,
+            d_intermediate=d_intermediate if d_intermediate > 0 else None,
             layer_idx=layer_idx,
             attention_config=attention_config,
         )

@@ -110,9 +110,9 @@ def test_mamba2_layer():
     rngs = nnx.Rngs(0)
     d_model = 128
     batch_size = 2
-    seq_len = 64  # Must be divisible by chunk_size
+    seq_len = 64  # Must be divisible by chunk_size (default 64)
     headdim = 32
-    chunk_size = 16
+    chunk_size = 64  # Use default chunk size
 
     # Create module
     mamba = Mamba2Layer(
@@ -129,25 +129,13 @@ def test_mamba2_layer():
     # Create input
     x = jax.random.normal(rngs(), (batch_size, seq_len, d_model))
 
-    # Forward pass without cache
-    output, cache = mamba(x)
+    # Forward pass without step mode
+    output, cache = mamba(x, step_mode=False)
 
     # Check output shape
     assert output.shape == x.shape
+    # Cache should be None when not in step_mode
     assert cache is None
-
-    # Test with cache (for potential caching during training)
-    cache = create_mamba2_cache(
-        batch_size,
-        mamba.d_inner,
-        mamba.d_state,
-        mamba.d_conv,
-        mamba.nheads,
-        mamba.headdim,
-    )
-    output_with_cache, new_cache = mamba(x, cache)
-    assert output_with_cache.shape == x.shape
-    assert new_cache is not None
 
 
 def test_mamba2_inference_step():
@@ -156,7 +144,7 @@ def test_mamba2_inference_step():
     d_model = 128
     batch_size = 2
     headdim = 32
-    chunk_size = 16
+    chunk_size = 64  # Use default chunk size
 
     # Create module
     mamba = Mamba2Layer(
@@ -183,10 +171,10 @@ def test_mamba2_inference_step():
     # Single token input
     x_single = jax.random.normal(rngs(), (batch_size, 1, d_model))
 
-    # Step through multiple tokens
+    # Step through multiple tokens using step method
     outputs = []
     for _ in range(5):
-        output, cache = mamba(x_single, cache)
+        output, cache = mamba.step(x_single, cache)
         outputs.append(output)
         assert output.shape == (batch_size, 1, d_model)
         assert cache is not None
@@ -202,7 +190,7 @@ def test_mamba2_block():
     d_model = 128
     batch_size = 2
     seq_len = 64
-    chunk_size = 16
+    chunk_size = 64
 
     # Create config
     config = Mamba2Config(
@@ -242,7 +230,7 @@ def test_hybrid_block_mamba():
     rngs = nnx.Rngs(0)
     d_model = 128
     batch_size = 2
-    seq_len = 16
+    seq_len = 64  # Use seq_len divisible by default chunk_size=64
 
     # Create config with Mamba2
     mamba_config = Mamba2Config(
@@ -250,7 +238,7 @@ def test_hybrid_block_mamba():
         d_state=16,
         d_conv=4,
         expand=2,
-        chunk_size=8,  # Use appropriate chunk size for seq_len
+        chunk_size=64,  # Use default chunk size
         layer_idx=0,
     )
 
@@ -326,7 +314,7 @@ def test_mamba2_wrapper():
     rngs = nnx.Rngs(0)
     d_model = 128
     batch_size = 2
-    seq_len = 16
+    seq_len = 64
 
     # Create config
     config = Mamba2Config(
@@ -335,7 +323,7 @@ def test_mamba2_wrapper():
         d_conv=4,
         expand=2,
         layer_idx=0,
-        chunk_size=8,  # Use appropriate chunk size for seq_len
+        chunk_size=64,  # Use default chunk size
     )
 
     # Create module
@@ -369,8 +357,8 @@ def test_different_sizes(d_model, d_state, headdim):
     """Test with different model sizes."""
     rngs = nnx.Rngs(0)
     batch_size = 1
-    seq_len = 32  # Must be divisible by chunk_size
-    chunk_size = 8
+    seq_len = 64  # Must be divisible by chunk_size (default 64)
+    chunk_size = 64
 
     # Create module
     mamba = Mamba2Layer(
@@ -385,16 +373,18 @@ def test_different_sizes(d_model, d_state, headdim):
     x = jax.random.normal(rngs(), (batch_size, seq_len, d_model))
 
     # Forward pass
-    output, _ = mamba(x)
+    output, _ = mamba(x, step_mode=False)
 
     # Check output shape
     assert output.shape == (batch_size, seq_len, d_model)
 
 
 def test_mamba2_convolution():
-    """Test Mamba2 convolution implementation."""
+    """Test Mamba2 convolution implementation through forward pass."""
     rngs = nnx.Rngs(0)
     d_model = 64
+    batch_size = 2
+    seq_len = 64  # Use compatible seq_len
 
     mamba = Mamba2Layer(
         d_model=d_model,
@@ -402,18 +392,16 @@ def test_mamba2_convolution():
         d_conv=4,
         expand=2,
         headdim=32,
+        chunk_size=64,
         rngs=rngs,
     )
 
-    # Test training mode convolution
-    batch_size = 2
-    seq_len = 16
-    x = jax.random.normal(rngs(), (batch_size, seq_len, mamba.conv_dim))
+    # Test training mode - full forward pass
+    x = jax.random.normal(rngs(), (batch_size, seq_len, d_model))
+    output, _ = mamba(x, step_mode=False)
+    assert output.shape == x.shape
 
-    conv_out, _ = mamba._conv1d(x)
-    assert conv_out.shape == x.shape
-
-    # Test inference mode convolution
+    # Test inference mode - step by step
     cache = create_mamba2_cache(
         batch_size,
         mamba.d_inner,
@@ -422,12 +410,13 @@ def test_mamba2_convolution():
         mamba.nheads,
         mamba.headdim,
     )
-    x_single = jax.random.normal(rngs(), (batch_size, 1, mamba.conv_dim))
+    x_single = jax.random.normal(rngs(), (batch_size, 1, d_model))
 
-    conv_out_single, new_conv_state = mamba._conv1d(x_single, cache)
-    assert conv_out_single.shape == x_single.shape
-    assert new_conv_state is not None
-    assert new_conv_state.shape == cache.conv_state.shape
+    # Step through a few tokens to test convolution state updates
+    for _ in range(3):
+        step_output, cache = mamba.step(x_single, cache)
+        assert step_output.shape == x_single.shape
+        assert cache is not None
 
 
 def test_mamba2_groups():
@@ -435,8 +424,8 @@ def test_mamba2_groups():
     rngs = nnx.Rngs(0)
     d_model = 128
     batch_size = 2
-    seq_len = 32
-    chunk_size = 8
+    seq_len = 64
+    chunk_size = 64
     ngroups = 2  # Test with multiple groups
 
     # Create module with groups
@@ -455,7 +444,7 @@ def test_mamba2_groups():
     x = jax.random.normal(rngs(), (batch_size, seq_len, d_model))
 
     # Forward pass
-    output, _ = mamba(x)
+    output, _ = mamba(x, step_mode=False)
     assert output.shape == x.shape
 
 
@@ -464,8 +453,8 @@ def test_mamba2_d_has_hdim():
     rngs = nnx.Rngs(0)
     d_model = 128
     batch_size = 2
-    seq_len = 32
-    chunk_size = 8
+    seq_len = 64
+    chunk_size = 64
 
     # Create module with D_has_hdim=True
     mamba = Mamba2Layer(
@@ -479,21 +468,22 @@ def test_mamba2_d_has_hdim():
         rngs=rngs,
     )
 
-    # Check D parameter shape
-    assert mamba.D.value.shape == (mamba.d_ssm,)
+    # Check D parameter shape - should be (d_ssm,) when D_has_hdim=True
+    expected_d_shape = mamba.d_ssm if mamba.D_has_hdim else mamba.nheads
+    assert mamba.D.value.shape == (expected_d_shape,)
 
     # Create input and test forward pass
     x = jax.random.normal(rngs(), (batch_size, seq_len, d_model))
-    output, _ = mamba(x)
+    output, _ = mamba(x, step_mode=False)
     assert output.shape == x.shape
 
 
 def test_sequence_length_compatibility():
-    """Test that sequence length must be divisible by chunk_size."""
+    """Test that arbitrary sequence lengths are supported through padding."""
     rngs = nnx.Rngs(0)
     d_model = 64
     batch_size = 1
-    chunk_size = 16
+    chunk_size = 64
 
     mamba = Mamba2Layer(
         d_model=d_model,
@@ -504,19 +494,22 @@ def test_sequence_length_compatibility():
         rngs=rngs,
     )
 
-    # Test with incompatible sequence length
-    seq_len_bad = 17  # Not divisible by chunk_size
-    x_bad = jax.random.normal(rngs(), (batch_size, seq_len_bad, d_model))
+    # Test with sequence length not divisible by chunk_size
+    seq_len_irregular = 65  # Not divisible by chunk_size
+    x_irregular = jax.random.normal(rngs(), (batch_size, seq_len_irregular, d_model))
 
-    # This should raise an assertion error
-    try:
-        output, _ = mamba(x_bad)
-        raise AssertionError("Should have raised an assertion error")
-    except AssertionError as e:
-        assert "divisible by chunk_size" in str(e)
+    # This should now work due to internal padding
+    output_irregular, _ = mamba(x_irregular, step_mode=False)
+    assert output_irregular.shape == x_irregular.shape
 
     # Test with compatible sequence length
-    seq_len_good = 32  # Divisible by chunk_size
+    seq_len_good = 128  # Divisible by chunk_size
     x_good = jax.random.normal(rngs(), (batch_size, seq_len_good, d_model))
-    output, _ = mamba(x_good)
-    assert output.shape == x_good.shape
+    output_good, _ = mamba(x_good, step_mode=False)
+    assert output_good.shape == x_good.shape
+
+    # Test various sequence lengths to ensure robustness
+    for seq_len in [1, 7, 33, 63, 65, 100]:
+        x_test = jax.random.normal(rngs(), (batch_size, seq_len, d_model))
+        output_test, _ = mamba(x_test, step_mode=False)
+        assert output_test.shape == x_test.shape

@@ -11,17 +11,38 @@ from .config import Mamba2Config
 
 
 def softplus(x: jax.Array) -> jax.Array:
-    """Softplus activation function."""
-    return jnp.log1p(jnp.exp(-jnp.abs(x))) + jnp.maximum(x, 0)
+    return jax.nn.softplus(x)
 
 
 def silu(x: jax.Array) -> jax.Array:
-    """SiLU (Swish) activation function."""
     return x * jax.nn.sigmoid(x)
 
 
 # For backward compatibility, alias the new cache structure
 InferenceCache = Mamba2CacheState
+
+
+def split_tensor(x, split_sizes, dim):
+    """
+    Splits the tensor x into multiple tensors based on split_sizes along dimension dim.
+
+    Args:
+        x: The input tensor to split.
+        split_sizes: The sizes to split the tensor into.
+        dim: The dimension along which to split.
+
+    Returns:
+        List of split tensors.
+    """
+    splits = []
+    start = 0
+    for size in split_sizes:
+        end = start + size
+        indices = jnp.arange(start, end)
+        split = jnp.take(x, indices=indices, axis=dim)
+        splits.append(split)
+        start = end
+    return splits
 
 
 def segsum(x: jax.Array) -> jax.Array:
@@ -80,9 +101,16 @@ def ssd(
         Y: (batch, seqlen, n_heads, d_head) - Output
         final_state: (batch, n_heads, d_head, d_state) - Final states
     """
-    assert x.shape[1] % chunk_size == 0, (
-        f"Sequence length {x.shape[1]} must be divisible by chunk_size {chunk_size}"
-    )
+    original_seq_len = x.shape[1]
+
+    # Pad sequence length to be divisible by chunk_size if necessary
+    pad_len = (chunk_size - original_seq_len % chunk_size) % chunk_size
+    if pad_len > 0:
+        # Pad inputs with zeros
+        x = jnp.pad(x, ((0, 0), (0, pad_len), (0, 0), (0, 0)), mode="constant")
+        A = jnp.pad(A, ((0, 0), (0, pad_len), (0, 0)), mode="constant")
+        B = jnp.pad(B, ((0, 0), (0, pad_len), (0, 0), (0, 0)), mode="constant")
+        C = jnp.pad(C, ((0, 0), (0, pad_len), (0, 0), (0, 0)), mode="constant")
 
     # Rearrange into chunks
     x, A, B, C = [
@@ -109,11 +137,6 @@ def ssd(
     # 3. Compute the inter-chunk SSM recurrence
     if initial_states is None:
         initial_states = jnp.zeros_like(states[:, :1])
-    else:
-        # Ensure initial states have the right shape
-        if initial_states.shape[1] == 1 and len(initial_states.shape) == 5:
-            # Reshape from (batch, 1, nheads, headdim, d_state) to (batch, 1, headdim, d_state)
-            initial_states = rearrange(initial_states, "b 1 h p n -> b 1 h p n")
 
     states = jnp.concatenate([initial_states, states], axis=1)
 
@@ -136,7 +159,37 @@ def ssd(
     Y = Y_diag + Y_off
     Y = rearrange(Y, "b c l h p -> b (c l) h p")
 
+    # Remove padding if it was added
+    if pad_len > 0:
+        Y = Y[:, :original_seq_len, :, :]
+
     return Y, final_state
+
+
+class RMSNorm(nnx.Module):
+    """RMS Normalization with optional gating."""
+
+    def __init__(self, d: int, eps: float = 1e-5, *, rngs: nnx.Rngs):
+        self.d = d
+        self.eps = eps
+        self.weight = nnx.Param(jnp.ones((d,)))
+
+    def __call__(self, x: jax.Array, z: jax.Array | None = None) -> jax.Array:
+        """
+        Apply RMS normalization with optional gating.
+
+        Args:
+            x: Input tensor
+            z: Optional gating tensor
+        """
+        # Apply gating first if z is provided
+        if z is not None:
+            x = x * silu(z)
+
+        # RMS normalization
+        mean_sq = jnp.mean(jnp.square(x), axis=-1, keepdims=True)
+        rsqrt = jax.lax.rsqrt(mean_sq + self.eps)
+        return x * rsqrt * self.weight.value
 
 
 class Mamba2Layer(nnx.Module):
@@ -161,34 +214,12 @@ class Mamba2Layer(nnx.Module):
         dt_init_floor: float = 1e-4,
         bias: bool = False,
         conv_bias: bool = True,
-        chunk_size: int = 256,
+        chunk_size: int = 64,  # Changed default to match reference
         layer_idx: int | None = None,
         *,
         rngs: nnx.Rngs,
     ):
-        """
-        Initialize Mamba2 layer.
-
-        Args:
-            d_model: Model dimension
-            d_state: SSM state dimension
-            d_conv: Local convolution kernel size
-            expand: Expansion factor for inner dimension
-            headdim: Head dimension for multi-head SSM
-            ngroups: Number of groups for grouped SSM
-            A_init_range: Range for initializing A matrix
-            D_has_hdim: Whether D parameter has head dimension
-            rmsnorm: Whether to use RMSNorm
-            norm_before_gate: Whether to normalize before gating
-            dt_min: Minimum dt value
-            dt_max: Maximum dt value
-            dt_init_floor: Floor for dt initialization
-            bias: Whether to use bias in linear projections
-            conv_bias: Whether to use bias in convolution
-            chunk_size: Chunk size for scan
-            layer_idx: Layer index (for caching)
-            rngs: Random number generators
-        """
+        """Initialize Mamba2 layer with reference-compatible defaults."""
         self.d_model = d_model
         self.d_state = d_state
         self.d_conv = d_conv
@@ -209,18 +240,16 @@ class Mamba2Layer(nnx.Module):
         self.norm_before_gate = norm_before_gate
 
         # Input projection: [z, x, B, C, dt]
-        # z and x are for gated MLP, B and C are SSM parameters, dt is time step
-        d_in_proj = 2 * self.d_inner + 2 * self.ngroups * self.d_state + self.nheads
+        d_in_proj = 2 * self.d_inner + 2 * self.d_state + self.nheads
         self.in_proj = nnx.Linear(self.d_model, d_in_proj, use_bias=bias, rngs=rngs)
 
         # Convolution for local context mixing
-        # Applied to [x, B, C] together
-        self.conv_dim = self.d_ssm + 2 * self.ngroups * self.d_state
+        self.conv_dim = self.d_inner + 2 * self.d_state
 
-        # Initialize convolution weights
+        # Initialize convolution weights to match reference format
         self.conv_weight = nnx.Param(
-            nnx.initializers.uniform(scale=0.1)(
-                rngs.params(), (self.d_conv, 1, self.conv_dim)
+            nnx.initializers.normal(stddev=0.02)(
+                rngs.params(), (self.conv_dim, 1, self.d_conv)
             )
         )
         if conv_bias:
@@ -255,239 +284,167 @@ class Mamba2Layer(nnx.Module):
 
         # Normalization
         if self.rmsnorm:
-            self.norm = nnx.RMSNorm(
-                self.d_ssm,
-                epsilon=1e-5,
-                rngs=rngs,
-            )
+            self.norm = RMSNorm(self.d_inner, rngs=rngs)
+        else:
+            self.norm = None
 
         # Output projection
         self.out_proj = nnx.Linear(self.d_inner, self.d_model, use_bias=bias, rngs=rngs)
 
-    def _conv1d(
-        self, x: jax.Array, cache: InferenceCache | None = None
-    ) -> tuple[jax.Array, jax.Array | None]:
-        """
-        Apply 1D depthwise convolution using JAX operations.
-
-        Args:
-            x: Input of shape (batch, seq_len, channels)
-            cache: Optional cache for inference mode
-
-        Returns:
-            output: Convolved output
-            updated_conv_state: Updated convolution state for caching
-        """
-        if cache is not None:
-            # Inference mode: use cached convolution state
-            assert x.shape[1] == 1, "Inference mode expects single token"
-            _batch_size = x.shape[0]
-
-            # Update cache: shift left and append new value
-            conv_state = cache.conv_state  # (batch, channels, d_conv)
-            conv_state = jnp.roll(conv_state, shift=-1, axis=-1)
-            conv_state = conv_state.at[:, :, -1].set(x[:, 0, :])
-
-            # Apply convolution weights
-            conv_weight = rearrange(self.conv_weight.value, "d 1 c -> c d")
-            output = jnp.sum(conv_state * conv_weight, axis=-1)  # (batch, channels)
-
-            if self.conv_bias is not None:
-                output = output + self.conv_bias.value
-
-            return output[:, None, :], conv_state
-        else:
-            # Training mode: full sequence convolution
-            batch, seq_len, channels = x.shape
-
-            # Prepare input for depthwise conv
-            # Need shape: (batch, seq_len, channels)
-
-            # Prepare weights: (d_conv, 1, channels) -> (d_conv, channels)
-            weights = self.conv_weight.value.squeeze(1)  # (d_conv, channels)
-
-            # Manual convolution implementation for depthwise
-            # Pad the input
-            x_padded = jnp.pad(
-                x, ((0, 0), (self.d_conv - 1, 0), (0, 0)), mode="constant"
-            )
-
-            # Apply convolution manually
-            output = jnp.zeros_like(x)
-            for i in range(self.d_conv):
-                # For each position in the kernel
-                output += x_padded[:, i : i + seq_len, :] * weights[i : i + 1, :]
-
-            if self.conv_bias is not None:
-                output = output + self.conv_bias.value
-
-            return output, None
-
     def __call__(
-        self, u: jax.Array, cache: InferenceCache | None = None
+        self,
+        u: jax.Array,
+        step_mode: bool = False,
+        h: InferenceCache | None = None,
     ) -> tuple[jax.Array, InferenceCache | None]:
         """
-        Forward pass of Mamba2 layer.
+        Forward pass matching reference implementation.
 
         Args:
             u: Input tensor of shape (batch, seq_len, d_model)
-            cache: Optional inference cache
-
-        Returns:
-            output: Output tensor of shape (batch, seq_len, d_model)
-            updated_cache: Updated cache if in inference mode
+            step_mode: Whether in step mode for inference
+            h: Optional inference cache
         """
-        batch, seq_len, _ = u.shape
-
-        # Check if we're in inference mode
-        if cache is not None and seq_len == 1:
-            return self._step(u, cache)
+        if step_mode and h is not None:
+            return self.step(u, h)
 
         # Input projection
-        zxbcdt = self.in_proj(u)  # (batch, seq_len, d_in_proj)
+        zxbcdt = self.in_proj(u)
 
-        # Split into components
-        z, xBC, dt = jnp.split(
-            zxbcdt,
-            [self.d_inner, self.d_inner + self.d_ssm + 2 * self.ngroups * self.d_state],
-            axis=-1,
-        )
+        # Split into components using reference split logic
+        split_sizes = [self.d_inner, self.d_inner + 2 * self.d_state, self.nheads]
+        z, xBC, dt = split_tensor(zxbcdt, split_sizes, dim=-1)
 
-        # Apply convolution to [x, B, C]
-        xBC = silu(self._conv1d(xBC)[0])
+        # Apply dt bias
+        dt = softplus(dt + self.dt_bias.value)
+
+        # Convolution - simplified to match reference behavior
+        # Pad for causal convolution
+        pad_amount = self.d_conv - 1
+        xBC_padded = jnp.pad(xBC, ((0, 0), (pad_amount, 0), (0, 0)), mode="constant")
+
+        # Apply depthwise convolution manually
+        conv_weight = self.conv_weight.value  # (conv_dim, 1, d_conv)
+        conv_weight = jnp.squeeze(conv_weight, axis=1).T  # (d_conv, conv_dim)
+
+        xBC_conv = jnp.zeros_like(xBC)
+        for i in range(self.d_conv):
+            xBC_conv += (
+                xBC_padded[:, i : i + xBC.shape[1], :] * conv_weight[i : i + 1, :]
+            )
+
+        if self.conv_bias is not None:
+            xBC_conv += self.conv_bias.value
+
+        xBC = silu(xBC_conv)
 
         # Split convolution output
-        x, B, C = jnp.split(
-            xBC, [self.d_ssm, self.d_ssm + self.ngroups * self.d_state], axis=-1
-        )
+        split_sizes = [self.d_inner, self.d_state, self.d_state]
+        x, B, C = split_tensor(xBC, split_sizes, dim=-1)
 
-        # Prepare SSM inputs
+        # Reshape for multi-head processing
         x = rearrange(x, "b l (h p) -> b l h p", h=self.nheads, p=self.headdim)
-        dt = softplus(dt + self.dt_bias.value)  # (batch, seq_len, nheads)
-        B = rearrange(B, "b l (g n) -> b l g n", g=self.ngroups, n=self.d_state)
-        C = rearrange(C, "b l (g n) -> b l g n", g=self.ngroups, n=self.d_state)
 
-        # Handle grouped B/C - for now just take first group
-        if self.ngroups > 1:
-            B = B[:, :, 0, :]
-            C = C[:, :, 0, :]
-        else:
-            B = B[:, :, 0, :]
-            C = C[:, :, 0, :]
-
-        # Expand B and C to match head dimension
-        B = repeat(B, "b l n -> b l h n", h=self.nheads)
-        C = repeat(C, "b l n -> b l h n", h=self.nheads)
-
-        # Apply dt to x
-        x = x * dt[:, :, :, None]
-
-        # Compute SSM with SSD algorithm
+        # Get A parameter
         A = -jnp.exp(self.A_log.value)  # (nheads,)
-        A_expanded = repeat(A, "h -> b l h", b=batch, l=seq_len)
 
-        y, final_state = ssd(x, A_expanded * dt, B, C, self.chunk_size)
+        # Run SSD algorithm
+        y, ssm_state = ssd(
+            x * dt[..., None],  # Apply dt scaling to input
+            A[None, None, :] * dt,  # Broadcast A and apply dt scaling
+            rearrange(B, "b l n -> b l 1 n"),  # Add head dimension
+            rearrange(C, "b l n -> b l 1 n"),  # Add head dimension
+            self.chunk_size,
+        )
 
         # Apply D parameter (skip connection)
         if self.D_has_hdim:
             D = rearrange(self.D.value, "(h p) -> h p", h=self.nheads, p=self.headdim)
-            y = y + D[None, None, :, :] * x / dt[:, :, :, None]
+            y = y + D[None, None, :, :] * x
         else:
             D = self.D.value  # (nheads,)
-            y = y + D[None, None, :, None] * x / dt[:, :, :, None]
+            y = y + D[None, None, :, None] * x
 
         # Reshape back
         y = rearrange(y, "b l h p -> b l (h p)")
 
-        # Apply normalization
-        if self.rmsnorm:
-            y = self.norm(y)
-        y = y * silu(z)
+        # Apply normalization with gating
+        y = self.norm(y, z) if self.norm is not None else y * silu(z)
 
         # Output projection
-        out = self.out_proj(y)
+        y = self.out_proj(y)
 
-        # Create new cache if needed
-        if cache is not None:
-            # Store convolution state
-            conv_state = rearrange(xBC, "b l d -> b d l")[:, :, -self.d_conv :]
-            new_cache = InferenceCache(conv_state, final_state)
-            return out, new_cache
+        # Create cache for inference
+        if step_mode:
+            # Store convolution state - match reference format
+            conv_state = rearrange(xBC, "b l d -> b d l")  # (batch, conv_dim, seqlen)
+            # Pad or truncate to d_conv length
+            pad_amount = self.d_conv - xBC.shape[1]
+            if pad_amount > 0:
+                conv_state = jnp.pad(
+                    conv_state, ((0, 0), (0, 0), (pad_amount, 0)), mode="constant"
+                )
+            else:
+                conv_state = conv_state[:, :, -self.d_conv :]
 
-        return out, None
+            h = InferenceCache(conv_state, ssm_state)
 
-    def _step(
-        self, u: jax.Array, cache: InferenceCache
-    ) -> tuple[jax.Array, InferenceCache]:
+        return y, h
+
+    def step(self, u: jax.Array, h: InferenceCache) -> tuple[jax.Array, InferenceCache]:
         """
-        Single step for autoregressive inference.
+        Single step inference matching reference implementation.
 
         Args:
             u: (batch, 1, d_model) single token input
-            cache: Current cache state
-
-        Returns:
-            output: (batch, 1, d_model) output
-            updated_cache: Updated cache
+            h: Current cache state
         """
-        assert u.shape[1] == 1, "Step mode expects single token"
-        _batch = u.shape[0]
+        assert u.shape[1] == 1, "Only one token can be decoded per inference step"
 
         # Input projection
-        zxbcdt = self.in_proj(u[:, 0, :])  # (batch, d_in_proj)
+        zxbcdt = self.in_proj(jnp.squeeze(u, axis=1))
 
-        # Split into components
-        z, xBC, dt = jnp.split(
-            zxbcdt,
-            [self.d_inner, self.d_inner + self.d_ssm + 2 * self.ngroups * self.d_state],
-            axis=-1,
-        )
+        # Split components
+        split_sizes = [self.d_inner, self.d_inner + 2 * self.d_state, self.nheads]
+        z, xBC, dt = split_tensor(zxbcdt, split_sizes, dim=-1)
 
-        # Update convolution state and apply conv
-        xBC_conv, updated_conv_state = self._conv1d(xBC[:, None, :], cache)
-        xBC = silu(xBC_conv[:, 0, :])
+        # Advance convolution input - match reference logic
+        rolled_conv_state = jnp.roll(h.conv_state, shift=-1, axis=-1)
+        updated_conv_state = rolled_conv_state.at[:, :, -1].set(xBC)
+        h = InferenceCache(conv_state=updated_conv_state, ssm_state=h.ssm_state)
 
-        # conv_state should not be None in inference mode
-        assert updated_conv_state is not None, (
-            "Conv state should not be None in step mode"
-        )
-        conv_state = updated_conv_state
+        # Convolution step
+        conv_weight = rearrange(self.conv_weight.value, "d 1 w -> d w")
+        xBC = jnp.sum(h.conv_state * conv_weight, axis=-1)
+
+        if self.conv_bias is not None:
+            xBC += self.conv_bias.value
+
+        xBC = silu(xBC)
 
         # Split convolution output
-        x, B, C = jnp.split(
-            xBC, [self.d_ssm, self.d_ssm + self.ngroups * self.d_state], axis=-1
-        )
+        split_sizes = [self.d_inner, self.d_state, self.d_state]
+        x, B, C = split_tensor(xBC, split_sizes, dim=-1)
 
-        # Process SSM parameters
+        # Calculate A
+        A = -jnp.exp(self.A_log.value)
+
+        # SSM step
+        dt = softplus(dt + self.dt_bias.value)
+
+        # Compute dA
+        dA = jnp.exp(dt * A)
+
+        # Reshape x for multi-head
         x = rearrange(x, "b (h p) -> b h p", h=self.nheads, p=self.headdim)
-        dt = softplus(dt + self.dt_bias.value)  # (batch, nheads)
-        B = rearrange(B, "b (g n) -> b g n", g=self.ngroups, n=self.d_state)
-        C = rearrange(C, "b (g n) -> b g n", g=self.ngroups, n=self.d_state)
 
-        # Handle groups
-        if self.ngroups > 1:
-            B = B[:, 0, :]
-            C = C[:, 0, :]
-        else:
-            B = B[:, 0, :]
-            C = C[:, 0, :]
-
-        # Compute SSM step
-        A = -jnp.exp(self.A_log.value)  # (nheads,)
-
-        # Compute dA = exp(A * dt)
-        dA = jnp.exp(dt * A[None, :])  # (batch, nheads)
-
-        # Update SSM state: h_new = h * dA + x * dt * B
-        # x: (batch, nheads, headdim)
-        # dt: (batch, nheads)
-        # B: (batch, d_state)
+        # Update SSM state
         dBx = jnp.einsum("bh, bn, bhp -> bhpn", dt, B, x)
+        updated_ssm_state = h.ssm_state * rearrange(dA, "b h -> b h 1 1") + dBx
+        h = InferenceCache(conv_state=h.conv_state, ssm_state=updated_ssm_state)
 
-        ssm_state = cache.ssm_state * dA[:, :, None, None] + dBx
-
-        # Compute output: y = C @ h
-        y = jnp.einsum("bhpn, bn -> bhp", ssm_state, C)
+        # Compute output
+        y = jnp.einsum("bhpn, bn -> bhp", updated_ssm_state, C)
 
         # Apply D parameter
         if self.D_has_hdim:
@@ -495,23 +452,20 @@ class Mamba2Layer(nnx.Module):
             y = y + D[None, :, :] * x
         else:
             D = self.D.value  # (nheads,)
-            y = y + D[None, :, None] * x
+            y = y + rearrange(D, "h -> h 1") * x
 
         # Reshape back
         y = rearrange(y, "b h p -> b (h p)")
 
-        # Apply normalization
-        if self.rmsnorm:
-            y = self.norm(y)
-        y = y * silu(z)
+        # Apply normalization with gating
+        y = self.norm(y, z) if self.norm is not None else y * silu(z)
 
         # Output projection
-        out = self.out_proj(y)
+        y = self.out_proj(y)
 
-        # Create updated cache
-        updated_cache = InferenceCache(conv_state, ssm_state)
+        y = jnp.expand_dims(y, axis=1)
 
-        return out[:, None, :], updated_cache
+        return y, h
 
 
 class Mamba2Block(nnx.Module):
@@ -555,5 +509,5 @@ class Mamba2Block(nnx.Module):
         """Forward pass with residual connection."""
         residual = x
         x = self.norm(x)
-        x, updated_cache = self.mamba(x, cache)
+        x, updated_cache = self.mamba(x, step_mode=(cache is not None), h=cache)
         return residual + x, updated_cache

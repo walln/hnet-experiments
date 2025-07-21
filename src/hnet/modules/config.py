@@ -22,7 +22,7 @@ class Mamba2Config:
     dt_init_floor: float = 1e-4
     bias: bool = False
     conv_bias: bool = True
-    chunk_size: int = 256
+    chunk_size: int = 64  # Changed from 256 to 64 to match reference
     norm_epsilon: float = 1e-5
     layer_idx: int | None = None
 
@@ -51,6 +51,7 @@ class HybridConfig:
     n_heads: int
     use_mamba: bool = True
     mlp_expand: int = 4
+    d_intermediate: int | None = None  # Exact intermediate dimension if specified
     norm_epsilon: float = 1e-5
     layer_idx: int | None = None
     # Mamba-specific
@@ -113,30 +114,30 @@ class SSMConfig:
     d_conv: int = 4
     expand: int = 2
     d_state: int = 128
-    chunk_size: int = 256
+    chunk_size: int = 64  # Changed from 256 to 64 to match reference
 
 
-@dataclass
-class HNetConfig:
-    """Configuration for H-Net model."""
+# @dataclass
+# class HNetConfig:
+#     """Configuration for H-Net model."""
 
-    arch_layout: list[str | list] | None = None
-    d_model: list[int] | None = None
-    # intermediate dimension for the FFNs (0 indicates no FFN)
-    d_intermediate: list[int] | None = None
-    vocab_size: int = 256
-    ssm_cfg: SSMConfig | None = None
-    attn_cfg: AttnConfig | None = None
-    tie_embeddings: bool = False
+#     arch_layout: list[str | list] | None = None
+#     d_model: list[int] | None = None
+#     # intermediate dimension for the FFNs (0 indicates no FFN)
+#     d_intermediate: list[int] | None = None
+#     vocab_size: int = 256
+#     ssm_cfg: SSMConfig | None = None
+#     attn_cfg: AttnConfig | None = None
+#     tie_embeddings: bool = False
 
-    def __post_init__(self):
-        if self.arch_layout is None:
-            self.arch_layout = []
-        if self.d_model is None:
-            self.d_model = []
-        if self.d_intermediate is None:
-            self.d_intermediate = []
-        if self.ssm_cfg is None:
-            self.ssm_cfg = SSMConfig()
-        if self.attn_cfg is None:
-            self.attn_cfg = AttnConfig()
+#     def __post_init__(self):
+#         if self.arch_layout is None:
+#             self.arch_layout = []
+#         if self.d_model is None:
+#             self.d_model = []
+#         if self.d_intermediate is None:
+#             self.d_intermediate = []
+#         if self.ssm_cfg is None:
+#             self.ssm_cfg = SSMConfig()
+#         if self.attn_cfg is None:
+#             self.attn_cfg = AttnConfig()

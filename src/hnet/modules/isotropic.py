@@ -4,9 +4,9 @@ from dataclasses import dataclass
 import flax.nnx as nnx
 import jax.numpy as jnp
 
+from hnet.models.config_hnet import AttnConfig, HNetConfig, SSMConfig
 from hnet.modules.block import HybridBlock, create_block
 from hnet.modules.cache import CacheState
-from hnet.modules.config import AttnConfig, HNetConfig, SSMConfig
 from hnet.modules.utils import get_seq_idx, get_stage_cfg
 
 
@@ -210,7 +210,7 @@ class Isotropic(nnx.Module):
             elif arch in ("t", "T"):
                 # Attention in packed mode expects (total_tokens, D)
                 if hidden_states.ndim == 3 and packed:
-                    hidden_states = hidden_states.squeeze(0)
+                    hidden_states = jnp.squeeze(hidden_states, axis=0)
             else:
                 raise NotImplementedError(f"Architecture {arch} not supported")
 
@@ -221,7 +221,7 @@ class Isotropic(nnx.Module):
         hidden_states = self.rmsnorm(hidden_states)
 
         if hidden_states.ndim == 3 and packed:
-            hidden_states = hidden_states.squeeze(0)
+            hidden_states = jnp.squeeze(hidden_states, axis=0)
 
         if inference_params is not None and mask is not None:
             # Update sequence offset

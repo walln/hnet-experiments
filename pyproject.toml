@@ -11,8 +11,11 @@ dependencies = [
     "einops>=0.8.1",
     "flax>=0.10.7",
     "jax>=0.6.2",
+    "omegaconf>=2.3.0",
     "torch>=2.7.1",
     "ty>=0.0.1a14",
+    "modal>=0.63.0",
+    "huggingface-hub>=0.33.4",
 ]
 
 [build-system]

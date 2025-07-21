@@ -6,6 +6,7 @@ import flax.nnx as nnx
 import jax
 import jax.numpy as jnp
 
+from hnet.models.config_hnet import HNetConfig
 from hnet.modules.chunking import (
     ChunkLayer,
     DeChunkLayer,
@@ -13,7 +14,6 @@ from hnet.modules.chunking import (
     RoutingModule,
     RoutingModuleState,
 )
-from hnet.modules.config import HNetConfig
 from hnet.modules.isotropic import Isotropic, IsotropicInferenceParams
 
 
