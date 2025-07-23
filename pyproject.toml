@@ -54,6 +54,7 @@ ignore = [
     "B008", # function-call-in-default-argument
     "N803", # lowercase variable name
     "N806", # lowercase variable name
+    "N812", # lowercase variable name
 ]
 
 # Allow fix for all enabled rules when using `--fix`

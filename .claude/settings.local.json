@@ -1,0 +1,25 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(uv run pytest:*)",
+      "Bash(uv run:*)",
+      "Bash(cp:*)",
+      "Bash(find:*)",
+      "Bash(grep:*)",
+      "Bash(python:*)",
+      "Bash(ls:*)",
+      "Bash(--mode test )",
+      "Bash(--model-path weights/HNet_2Stage_XL.pt )",
+      "Bash(--config-path configs/hnet_2stage_XL.json )",
+      "Bash(--prompts \"Hello world\" )",
+      "Bash(--max-tokens 5)",
+      "Bash(--mode test )",
+      "Bash(--model-path weights/HNet_2Stage_XL.pt )",
+      "Bash(--config-path configs/hnet_2stage_XL.json )",
+      "Bash(--prompts \"Hello world\" )",
+      "Bash(--max-tokens 20)",
+      "Bash(rm:*)"
+    ],
+    "deny": []
+  }
+}
