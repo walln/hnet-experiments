@@ -137,7 +137,8 @@ class CausalMHA(nn.Module):
         num_heads: int,
         qkv_proj_bias: bool = False,
         out_proj_bias: bool = False,
-        rotary_emb_dim: int = 0,  # kept for API compatibility; unused here
+        rotary_emb_dim: int = 0,
+        window_size: int = -1,
         device=None,
         dtype=None,
         layer_idx: Optional[int] = None,
@@ -147,6 +148,10 @@ class CausalMHA(nn.Module):
         self.num_heads = num_heads
         assert d_model % num_heads == 0
         self.head_dim = d_model // num_heads
+        self.layer_idx = layer_idx
+        self.rotary_emb_dim = int(rotary_emb_dim) if rotary_emb_dim is not None else 0
+        self.rotary_base = 10000.0
+        self.window_size = int(window_size) if window_size is not None else -1
         factory_kwargs = {"device": device, "dtype": dtype}
 
         self.Wqkv = nn.Linear(d_model, 3 * d_model, bias=qkv_proj_bias, **factory_kwargs)
@@ -167,12 +172,58 @@ class CausalMHA(nn.Module):
         L = q.size(-2)
         causal = torch.triu(torch.ones(L, L, device=q.device, dtype=torch.bool), diagonal=1)
         attn_scores.masked_fill_(causal, float("-inf"))
+        if self.window_size is not None and self.window_size > 0:
+            # Disallow keys older than window_size
+            idx = torch.arange(L, device=q.device)
+            # True where j < i - (W-1)
+            win_mask = idx[None, :] < (idx[:, None] - (self.window_size - 1))
+            attn_scores.masked_fill_(win_mask, float("-inf"))
         if attn_mask is not None:
             # attn_mask: (B, L) with True for valid tokens
             mask = attn_mask[:, None, None, :].expand(-1, self.num_heads, L, -1)
             attn_scores = attn_scores.masked_fill(~mask, float("-inf"))
         attn = torch.softmax(attn_scores, dim=-1)
         return torch.matmul(attn, v)
+
+    def _rotary_cos_sin(self, L: int, offset: int, device, dtype):
+        """Compute rotary cos/sin tables for sequence length L starting at position offset.
+        Returns cos, sin with shape (L, rotary_emb_dim//2) in given dtype.
+        """
+        ro_dim = self.rotary_emb_dim
+        assert ro_dim % 2 == 0 and ro_dim <= self.head_dim
+        inv_freq = 1.0 / (
+            self.rotary_base ** (torch.arange(0, ro_dim, 2, device=device, dtype=torch.float32) / ro_dim)
+        )
+        # positions [offset, offset+L-1]
+        t = torch.arange(offset, offset + L, device=device, dtype=torch.float32)
+        freqs = torch.outer(t, inv_freq)  # (L, ro_dim/2)
+        cos = torch.cos(freqs).to(dtype)
+        sin = torch.sin(freqs).to(dtype)
+        return cos, sin
+
+    def _apply_rotary(self, q: torch.Tensor, k: torch.Tensor, offset: int = 0):
+        """Apply rotary embeddings on first rotary_emb_dim of q and k (NeoX style, non-interleaved).
+        q, k: (B, H, L, Dh)
+        """
+        if self.rotary_emb_dim <= 0:
+            return q, k
+        B, H, L, Dh = q.shape
+        ro_dim = self.rotary_emb_dim
+        cos, sin = self._rotary_cos_sin(L, offset, q.device, q.dtype)
+        # shape to (1,1,L,ro_dim/2) for broadcast
+        cos = cos.view(1, 1, L, -1)
+        sin = sin.view(1, 1, L, -1)
+        def rotate_half(x):
+            x1, x2 = x.chunk(2, dim=-1)  # (..., ro_dim/2)
+            xr1 = x1 * cos - x2 * sin
+            xr2 = x2 * cos + x1 * sin
+            return torch.cat([xr1, xr2], dim=-1)
+        def apply(x):
+            x_ro = x[..., :ro_dim]
+            x_rest = x[..., ro_dim:]
+            x_ro_new = rotate_half(x_ro)
+            return torch.cat([x_ro_new, x_rest], dim=-1)
+        return apply(q), apply(k)
 
     def forward(
         self,
@@ -197,7 +248,7 @@ class CausalMHA(nn.Module):
                 L = e - s
                 padded[b, :L] = x[s:e]
                 mask[b, :L] = True
-            out = self._forward_padded(padded, attn_mask=mask)
+            out = self._forward_padded(padded, attn_mask=mask, inference_params=None)
             # Repack
             parts = []
             for b in range(B):
@@ -206,9 +257,9 @@ class CausalMHA(nn.Module):
             return torch.cat(parts, dim=0)
         else:
             assert x.dim() == 3 and attn_mask is not None, "Provide attn_mask for padded input"
-            return self._forward_padded(x, attn_mask=attn_mask)
+            return self._forward_padded(x, attn_mask=attn_mask, inference_params=inference_params)
 
-    def _forward_padded(self, x: torch.Tensor, attn_mask: Optional[torch.Tensor]) -> torch.Tensor:
+    def _forward_padded(self, x: torch.Tensor, attn_mask: Optional[torch.Tensor], inference_params=None) -> torch.Tensor:
         B, L, _ = x.shape
         x_dtype = x.dtype
         w_dtype = self.Wqkv.weight.dtype
@@ -219,9 +270,37 @@ class CausalMHA(nn.Module):
         q = self._split_heads(q)  # (B, H, L, Dh)
         k = self._split_heads(k)
         v = self._split_heads(v)
+        # Rotary (absolute positions starting at seqlen_offset if provided)
+        if self.rotary_emb_dim > 0:
+            offset = int(getattr(inference_params, "seqlen_offset", 0) or 0)
+            q, k = self._apply_rotary(q, k, offset=offset)
         ctx = self._causal_attn(q, k, v, attn_mask)  # (B, H, L, Dh)
         ctx = self._merge_heads(ctx)  # (B, L, D)
         out = self.out_proj(ctx)
+        # Write K/V to cache during prefill if inference_params provided
+        if inference_params is not None:
+            assert getattr(self, "layer_idx", None) is not None, "layer_idx required for KV cache"
+            # lazy-allocate cache
+            kv_cache = inference_params.key_value_memory_dict.get(self.layer_idx)
+            if kv_cache is None:
+                dtype = self.out_proj.weight.dtype
+                device = self.out_proj.weight.device
+                kv_cache = torch.empty(
+                    inference_params.max_batch_size,
+                    inference_params.max_seqlen,
+                    2,
+                    self.num_heads,
+                    self.head_dim,
+                    dtype=dtype,
+                    device=device,
+                )
+                inference_params.key_value_memory_dict[self.layer_idx] = kv_cache
+            batch_start = inference_params.batch_size_offset
+            batch_end = batch_start + B
+            seq_start = inference_params.seqlen_offset
+            seq_end = seq_start + L
+            kv_cur = torch.stack([k.transpose(1, 2), v.transpose(1, 2)], dim=2)  # (B, L, 2, H, Dh)
+            kv_cache[batch_start:batch_end, seq_start:seq_end, ...] = kv_cur
         return out.to(x_dtype)
 
     def allocate_inference_cache(self, batch_size: int, max_seqlen: int, dtype=None):
@@ -229,10 +308,56 @@ class CausalMHA(nn.Module):
         return None
 
     def step(self, x: torch.Tensor, inference_params=None) -> torch.Tensor:
-        # For simplicity, call standard forward on a length-1 window.
+        # Incremental decoding with KV cache and rotary.
         assert x.dim() == 3 and x.size(1) == 1
-        mask = torch.ones(x.size(0), 1, device=x.device, dtype=torch.bool)
-        return self._forward_padded(x, attn_mask=mask)
+        B, L, _ = x.shape
+        x_dtype = x.dtype
+        w_dtype = self.Wqkv.weight.dtype
+        if x_dtype != w_dtype:
+            x = x.to(w_dtype)
+        qkv = self.Wqkv(x)
+        q, k, v = torch.chunk(qkv, 3, dim=-1)
+        q = self._split_heads(q)  # (B, H, 1, Dh)
+        k = self._split_heads(k)
+        v = self._split_heads(v)
+        if self.rotary_emb_dim > 0:
+            offset = int(getattr(inference_params, "seqlen_offset", 0) or 0)
+            q, k = self._apply_rotary(q, k, offset=offset)
+        # Lazy-allocate / fetch KV cache
+        assert getattr(self, "layer_idx", None) is not None, "layer_idx required for KV cache"
+        kv_cache = inference_params.key_value_memory_dict.get(self.layer_idx)
+        if kv_cache is None:
+            dtype = self.out_proj.weight.dtype
+            device = self.out_proj.weight.device
+            kv_cache = torch.empty(
+                inference_params.max_batch_size,
+                inference_params.max_seqlen,
+                2,
+                self.num_heads,
+                self.head_dim,
+                dtype=dtype,
+                device=device,
+            )
+            inference_params.key_value_memory_dict[self.layer_idx] = kv_cache
+        batch_start = inference_params.batch_size_offset
+        batch_end = batch_start + B
+        seq_start = inference_params.seqlen_offset
+        seq_end = seq_start + 1
+        # Write current K/V
+        kv_cache[batch_start:batch_end, seq_start:seq_end, 0, ...] = k.transpose(1, 2)  # K
+        kv_cache[batch_start:batch_end, seq_start:seq_end, 1, ...] = v.transpose(1, 2)  # V
+        # Read past K/V up to seq_end, with optional windowing
+        start = max(0, seq_end - self.window_size) if (self.window_size is not None and self.window_size > 0) else 0
+        K_all = kv_cache[batch_start:batch_end, start:seq_end, 0, ...].transpose(1, 2)  # (B, H, S, Dh)
+        V_all = kv_cache[batch_start:batch_end, start:seq_end, 1, ...].transpose(1, 2)
+        # Attention over full prefix
+        scale = self.head_dim ** -0.5
+        attn_scores = torch.matmul(q, K_all.transpose(-2, -1)) * scale  # (B, H, 1, S)
+        attn = torch.softmax(attn_scores, dim=-1)
+        ctx = torch.matmul(attn, V_all)  # (B, H, 1, Dh)
+        ctx = self._merge_heads(ctx)  # (B, 1, D)
+        out = self.out_proj(ctx)
+        return out.to(x_dtype)
 
 
 # ============================
@@ -489,6 +614,7 @@ class Isotropic(nn.Module):
                         self.d_model,
                         num_heads=self.attn_cfg.get("num_heads", 8),
                         rotary_emb_dim=self.attn_cfg.get("rotary_emb_dim", 0),
+                        window_size=self.attn_cfg.get("window_size", -1),
                         **factory_kwargs,
                         layer_idx=layer_idx,
                     )
@@ -562,8 +688,11 @@ class Isotropic(nn.Module):
             x = torch.cat(outs, dim=0)
 
         if inference_params is not None:
-            # Simplified update: assume batch size 1 for step
-            inference_params.seqlen_offset += x.shape[1] if x.dim() == 3 else x.shape[0]
+            # Follow reference: assert batch size 1 and padded path when tracking seqlen_offset
+            assert mask is not None, "Mask must be provided if inference_params is provided"
+            assert mask.shape[0] == 1, "seqlen_offset handling assumes batch size 1"
+            assert x.dim() == 3, "Inference with inference_params expects padded (B, L, D)"
+            inference_params.seqlen_offset += x.shape[1]
 
         return x
 
@@ -627,6 +756,14 @@ class RoutingModule(nn.Module):
         inference_params: Optional[RoutingModuleState] = None,
     ) -> RoutingModuleOutput:
         assert (mask is not None) or (cu_seqlens is not None), "Provide mask or cu_seqlens"
+        if inference_params is not None:
+            # Match reference behavior: prefill requires mask and unseen state
+            assert mask is not None, "Mask must be provided if inference_params is provided"
+            assert (
+                (~inference_params.has_seen_tokens).all()
+            ), "Cannot have seen tokens when inference_params is provided"
+            # Not supporting packed + inference_params
+            assert cu_seqlens is None, "Packed mode with inference_params is not supported"
 
         if cu_seqlens is not None:
             # Treat as single batch for computation convenience
@@ -657,6 +794,21 @@ class RoutingModule(nn.Module):
         boundary_mask = selected_idx == 1
         if mask is not None:
             boundary_mask = boundary_mask & mask
+
+        if inference_params is not None:
+            # Update prefill state so that step() has correct previous token context
+            has_mask = mask.any(dim=-1)
+            inference_params.has_seen_tokens.copy_(has_mask | inference_params.has_seen_tokens)
+            last_mask = torch.clamp(mask.sum(dim=-1) - 1, min=0)
+            idx_b = torch.arange(hidden_states.shape[0], device=hidden_states.device)
+            last_h = hidden_states[idx_b, last_mask]
+            inference_params.last_hidden_state.copy_(
+                torch.where(
+                    has_mask.unsqueeze(-1),
+                    last_h,
+                    inference_params.last_hidden_state,
+                )
+            )
         selected_probs = boundary_prob.gather(dim=-1, index=selected_idx.unsqueeze(-1))
         return RoutingModuleOutput(boundary_prob=boundary_prob, boundary_mask=boundary_mask, selected_probs=selected_probs)
 
@@ -1260,10 +1412,14 @@ def main():
     parser.add_argument("--max-new-tokens", type=int, default=128)
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--top-p", type=float, default=1.0)
+    parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--dtype", type=str, default="bfloat16", choices=["bfloat16", "float32"]) 
     parser.add_argument("--strict", action="store_true", help="Strict state_dict load (fail on any mismatch)")
     args = parser.parse_args()
+
+    # Set manual seed for deterministic sampling
+    torch.manual_seed(args.seed)
 
     model = load_model(args.model_path, args.config_path, device=args.device, dtype=args.dtype, strict=args.strict or True)
     tok = ByteTokenizer()
