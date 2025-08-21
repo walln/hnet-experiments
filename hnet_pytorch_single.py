@@ -830,9 +830,9 @@ class RoutingModule(nn.Module):
         boundary_prob = torch.where(inference_params.has_seen_tokens, boundary_prob, torch.ones_like(boundary_prob))
         boundary_prob = torch.stack(((1 - boundary_prob), boundary_prob), dim=-1)
         inference_params.has_seen_tokens.copy_(torch.ones_like(inference_params.has_seen_tokens))
-        selected_idx = torch.argmax(boundary_prob, dim=-1)
-        boundary_mask = selected_idx == 1
-        selected_probs = boundary_prob.gather(dim=-1, index=selected_idx.unsqueeze(-1))
+        # Match reference: threshold 0.5 for boundary
+        boundary_mask = boundary_prob[..., 1] > 0.5
+        selected_probs = boundary_prob.max(dim=-1).values.unsqueeze(-1)
         return RoutingModuleOutput(boundary_prob=boundary_prob, boundary_mask=boundary_mask, selected_probs=selected_probs)
 
 
@@ -1421,7 +1421,7 @@ def main():
     # Set manual seed for deterministic sampling
     torch.manual_seed(args.seed)
 
-    model = load_model(args.model_path, args.config_path, device=args.device, dtype=args.dtype, strict=args.strict or True)
+    model = load_model(args.model_path, args.config_path, device=args.device, dtype=args.dtype, strict=args.strict)
     tok = ByteTokenizer()
     print(args.prompt, end="", flush=True)
     buf = []
