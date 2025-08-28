@@ -11,7 +11,7 @@ from jax import lax
 from hnet.modules.norms import RMSNorm
 
 
-class PyTorchSSM(nnx.Module):
+class SSM(nnx.Module):
     def __init__(
         self,
         d_model: int,

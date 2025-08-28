@@ -13,7 +13,7 @@ from hnet.modules.block import Block
 from hnet.modules.mha import CausalMHA
 from hnet.modules.mlp import SwiGLU
 from hnet.modules.norms import RMSNorm
-from hnet.modules.ssm import PyTorchSSM
+from hnet.modules.ssm import SSM
 from hnet.state import InferenceParams
 from hnet.utils import get_stage_cfg
 
@@ -60,7 +60,7 @@ class Isotropic(nnx.Module):
                         rngs=rngs,
                     )
                 elif arch in ("m", "M"):
-                    mixer = PyTorchSSM(
+                    mixer = SSM(
                         self.d_model,
                         d_state=self.ssm_cfg.get("d_state", 128),
                         d_conv=self.ssm_cfg.get("d_conv", 4),
