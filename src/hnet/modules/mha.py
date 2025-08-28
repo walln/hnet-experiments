@@ -1,431 +1,277 @@
-# Copyright (c) 2025, Nick Wall.
-# JAX implementation of multi-head attention based on the Tri Dao PyTorch implementation.
-# Copyright (c) 2023, Tri Dao.
+"""Causal Multi-Head Attention without FlashAttention kernels."""
+
+from __future__ import annotations
 
 import flax.nnx as nnx
 import jax
 import jax.numpy as jnp
-from einops import rearrange
-
-from hnet.modules.cache import AttentionCacheState
-from hnet.modules.config import AttentionConfig
-from hnet.modules.rotary import RotaryEmbedding
-
-
-def causal_mask(
-    seq_len: int, seq_len_k: int | None = None, dtype=jnp.float32
-) -> jax.Array:
-    """Create a causal mask for self-attention."""
-    if seq_len_k is None:
-        seq_len_k = seq_len
-    # Create a mask where positions can only attend to earlier positions
-    row_indices = jnp.arange(seq_len)[:, None]
-    col_indices = jnp.arange(seq_len_k)[None, :]
-    mask = (row_indices >= col_indices).astype(dtype)
-    return mask
-
-
-def sliding_window_mask(
-    seq_len: int, window_size: int, seq_len_k: int | None = None, dtype=jnp.float32
-) -> jax.Array:
-    """Create a sliding window attention mask."""
-    if seq_len_k is None:
-        seq_len_k = seq_len
-
-    if window_size < 0:
-        return causal_mask(seq_len, seq_len_k, dtype)
-
-    mask = jnp.zeros((seq_len, seq_len_k), dtype=dtype)
-    for i in range(seq_len):
-        start = max(0, i - window_size + 1)
-        end = min(seq_len_k, i + 1)
-        mask = mask.at[i, start:end].set(1.0)
-    return mask
-
-
-def scaled_dot_product_attention(
-    q: jax.Array,
-    k: jax.Array,
-    v: jax.Array,
-    mask: jax.Array | None = None,
-    softmax_scale: float | None = None,
-    causal: bool = True,
-    window_size: int = -1,
-) -> jax.Array:
-    """
-    Scaled dot-product attention.
-
-    Args:
-        q: Query tensor of shape (batch, seq_len, num_heads, head_dim)
-        k: Key tensor of shape (batch, seq_len_k, num_heads, head_dim)
-        v: Value tensor of shape (batch, seq_len_k, num_heads, head_dim)
-        mask: Optional attention mask
-        softmax_scale: Scaling factor for attention scores
-        causal: Whether to use causal masking
-        window_size: Sliding window size (-1 for global attention)
-
-    Returns:
-        Attention output of shape (batch, seq_len, num_heads, head_dim)
-    """
-    batch, seq_len, num_heads, head_dim = q.shape
-    seq_len_k = k.shape[1]
-
-    if softmax_scale is None:
-        softmax_scale = head_dim**-0.5
-
-    # Compute attention scores
-    # Reshape for batched matrix multiply: (batch * num_heads, seq_len, head_dim)
-    q = rearrange(q, "b s h d -> (b h) s d")
-    k = rearrange(k, "b s h d -> (b h) s d")
-    v = rearrange(v, "b s h d -> (b h) s d")
-
-    # Compute scores: (batch * num_heads, seq_len, seq_len_k)
-    scores = jnp.matmul(q, k.swapaxes(-2, -1)) * softmax_scale
-
-    # Apply mask if needed
-    if causal or window_size > 0:
-        if window_size > 0:
-            attn_mask = sliding_window_mask(seq_len, window_size, seq_len_k)
-        else:
-            attn_mask = causal_mask(seq_len, seq_len_k)
-
-        # Apply mask directly to the (batch * num_heads, seq_len, seq_len_k) scores
-        # The mask is broadcasted across the batch dimension
-        scores = jnp.where(attn_mask[None, :, :], scores, -1e9)
-
-    if mask is not None:
-        scores = scores + mask
-
-    # Apply softmax
-    attn_weights = jax.nn.softmax(scores, axis=-1)
-
-    # Apply attention to values
-    output = jnp.matmul(attn_weights, v)
-
-    # Reshape back
-    output = rearrange(output, "(b h) s d -> b s h d", b=batch, h=num_heads)
-
-    return output
-
-
-class CausalSelfAttention(nnx.Module):
-    """JAX implementation of scaled dot product attention with softmax."""
-
-    def __init__(
-        self,
-        softmax_scale: float | None = None,
-        window_size: tuple[int, int] = (-1, -1),
-        *,
-        rngs: nnx.Rngs,
-    ):
-        """
-        Initialize causal self-attention.
-
-        Args:
-            softmax_scale: The temperature to use for the softmax attention.
-                         (default: 1/sqrt(d_keys) where d_keys is computed at runtime)
-            window_size: Sliding window size for local attention
-            rngs: Random number generators (required by nnx)
-        """
-        self.softmax_scale = softmax_scale
-        self.window_size = window_size[0]  # Use first element for self-attention
-
-    def __call__(
-        self,
-        qkv: jax.Array,
-        cu_seqlens: jax.Array | None = None,
-        max_seqlen: int | None = None,
-    ) -> jax.Array:
-        """
-        Implements the multihead softmax attention.
-
-        Args:
-            qkv: The tensor containing the query, key, and value.
-                If cu_seqlens is None, then qkv has shape (B, S, 3, H, D).
-                Packed sequences not yet supported in JAX version.
-            cu_seqlens: Not yet supported
-            max_seqlen: Not yet supported
-
-        Returns:
-            out: (B, S, H, D)
-        """
-        if cu_seqlens is not None:
-            raise NotImplementedError(
-                "Packed sequence support not yet implemented in JAX version"
-            )
-
-        assert qkv.ndim == 5, f"Expected qkv to have 5 dimensions, got {qkv.ndim}"
-        batch, seq_len, three, num_heads, head_dim = qkv.shape
-        assert three == 3, f"Expected 3 QKV components, got {three}"
-
-        q = qkv[:, :, 0]  # (B, S, H, D)
-        k = qkv[:, :, 1]  # (B, S, H, D)
-        v = qkv[:, :, 2]  # (B, S, H, D)
-
-        return scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            softmax_scale=self.softmax_scale,
-            causal=True,
-            window_size=self.window_size,
-        )
-
-
-class CausalCrossAttention(nnx.Module):
-    """JAX implementation of scaled dot product cross-attention."""
-
-    def __init__(
-        self,
-        softmax_scale: float | None = None,
-        window_size: tuple[int, int] = (-1, -1),
-        *,
-        rngs: nnx.Rngs,
-    ):
-        """
-        Initialize causal cross-attention.
-
-        Args:
-            softmax_scale: The temperature to use for the softmax attention.
-            window_size: Sliding window size for local attention
-            rngs: Random number generators (required by nnx)
-        """
-        self.softmax_scale = softmax_scale
-        self.window_size = window_size[0]
-
-    def __call__(
-        self,
-        q: jax.Array,
-        kv: jax.Array,
-        cu_seqlens: jax.Array | None = None,
-        max_seqlen: int | None = None,
-        cu_seqlens_k: jax.Array | None = None,
-        max_seqlen_k: int | None = None,
-    ) -> jax.Array:
-        """
-        Implements the multihead softmax cross-attention.
-
-        Args:
-            q: The tensor containing the query. (B, Sq, H, D)
-            kv: The tensor containing the key and value. (B, Sk, 2, H_k, D)
-            cu_seqlens: Not yet supported
-            max_seqlen: Not yet supported
-            cu_seqlens_k: Not yet supported
-            max_seqlen_k: Not yet supported
-
-        Returns:
-            Attention output of shape (B, Sq, H, D)
-        """
-        if cu_seqlens is not None:
-            raise NotImplementedError(
-                "Packed sequence support not yet implemented in JAX version"
-            )
-
-        assert q.ndim == 4, f"Expected q to have 4 dimensions, got {q.ndim}"
-        assert kv.ndim == 5, f"Expected kv to have 5 dimensions, got {kv.ndim}"
-        assert kv.shape[2] == 2, f"Expected 2 KV components, got {kv.shape[2]}"
-
-        k = kv[:, :, 0]  # (B, Sk, H_k, D)
-        v = kv[:, :, 1]  # (B, Sk, H_k, D)
-
-        return scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            softmax_scale=self.softmax_scale,
-            causal=True,
-            window_size=self.window_size,
-        )
-
-
-class InferenceParams:
-    """Parameters for generation/inference mode with KV caching."""
-
-    def __init__(
-        self,
-        max_batch_size: int,
-        max_seqlen: int,
-        seqlen_offset: int = 0,
-        batch_size_offset: int = 0,
-        lengths_per_sample: jax.Array | None = None,
-    ):
-        self.max_batch_size = max_batch_size
-        self.max_seqlen = max_seqlen
-        self.seqlen_offset = seqlen_offset
-        self.batch_size_offset = batch_size_offset
-        self.lengths_per_sample = lengths_per_sample
-        # In JAX, we'll handle KV cache differently than PyTorch
-        # Instead of a mutable dict, we'll use explicit state management
-        self.key_value_memory_dict = {}
 
 
 class CausalMHA(nnx.Module):
-    """Causal Multi-Head Attention module in JAX."""
-
     def __init__(
         self,
-        config: AttentionConfig,
-        *,
-        rngs: nnx.Rngs,
-    ):
-        """
-        Initialize Causal MHA.
+        d_model: int,
+        num_heads: int,
+        qkv_proj_bias: bool = False,
+        out_proj_bias: bool = False,
+        rotary_emb_dim: int = 0,
+        window_size: int = -1,
+        dtype=jnp.float32,
+        layer_idx: int | None = None,
+        rngs: nnx.Rngs = nnx.Rngs(0),
+    ) -> None:
+        self.d_model = d_model
+        self.num_heads = num_heads
+        assert d_model % num_heads == 0
+        self.head_dim = d_model // num_heads
+        self.layer_idx = layer_idx
+        self.rotary_emb_dim = int(rotary_emb_dim) if rotary_emb_dim is not None else 0
+        self.rotary_base = 10000.0
+        self.window_size = int(window_size) if window_size is not None else -1
 
-        Args:
-            config: Attention configuration
-            rngs: Random number generators
-        """
-        self.config = config
-        self.d_model = config.d_model
-        self.num_heads = config.num_heads
-        self.layer_idx = config.layer_idx
-        self.softmax_scale = config.softmax_scale
-        self.rotary_emb_dim = config.rotary_emb_dim
-
-        assert config.d_model % config.num_heads == 0, (
-            "d_model must be divisible by num_heads"
-        )
-        self.head_dim = config.d_model // config.num_heads
-        qkv_dim = self.head_dim * (3 * self.num_heads)
-
-        # Initialize rotary embeddings if needed
-        if self.rotary_emb_dim > 0:
-            self.rotary_emb = RotaryEmbedding(
-                dim=config.rotary_emb_dim,
-                base=config.rotary_emb_base,
-                interleaved=config.rotary_emb_interleaved,
-                rngs=rngs,
-            )
-        else:
-            self.rotary_emb = None
-
-        # Initialize linear layers
         self.Wqkv = nnx.Linear(
-            config.d_model, qkv_dim, use_bias=config.qkv_proj_bias, rngs=rngs
+            d_model, 3 * d_model, use_bias=qkv_proj_bias, dtype=dtype, rngs=rngs
         )
-
-        # Initialize attention modules
-        self.inner_attn = CausalSelfAttention(
-            softmax_scale=config.softmax_scale,
-            window_size=(config.window_size, -1),
-            rngs=rngs,
-        )
-        self.inner_cross_attn = CausalCrossAttention(
-            softmax_scale=config.softmax_scale,
-            window_size=(config.window_size, -1),
-            rngs=rngs,
-        )
-
         self.out_proj = nnx.Linear(
-            config.d_model, config.d_model, use_bias=config.out_proj_bias, rngs=rngs
+            d_model, d_model, use_bias=out_proj_bias, dtype=dtype, rngs=rngs
         )
+
+    def _split_heads(self, x: jnp.ndarray) -> jnp.ndarray:
+        return x.reshape(*x.shape[:-1], self.num_heads, self.head_dim).transpose(
+            0, 2, 1, 3
+        )
+
+    def _merge_heads(self, x: jnp.ndarray) -> jnp.ndarray:
+        return x.transpose(0, 2, 1, 3).reshape(x.shape[0], x.shape[2], self.d_model)
+
+    def _causal_attn(
+        self,
+        q: jnp.ndarray,
+        k: jnp.ndarray,
+        v: jnp.ndarray,
+        attn_mask: jnp.ndarray | None,
+    ) -> jnp.ndarray:
+        # q, k, v: (B, H, L, D)
+        scale = self.head_dim**-0.5
+        attn_scores = jnp.matmul(q, k.transpose(0, 1, 3, 2)) * scale  # (B, H, L, L)
+        L = q.shape[-2]
+        causal = jnp.triu(jnp.ones((L, L), dtype=jnp.bool_), k=1)
+        attn_scores = jnp.where(causal, -jnp.inf, attn_scores)
+
+        if self.window_size is not None and self.window_size > 0:
+            idx = jnp.arange(L)
+            win_mask = idx[None, :] < (idx[:, None] - (self.window_size - 1))
+            attn_scores = jnp.where(win_mask, -jnp.inf, attn_scores)
+
+        if attn_mask is not None:
+            mask = (
+                attn_mask[:, None, None, :]
+                .repeat(self.num_heads, axis=1)
+                .repeat(L, axis=2)
+            )
+            attn_scores = jnp.where(~mask, -jnp.inf, attn_scores)
+
+        attn = jax.nn.softmax(attn_scores, axis=-1)
+        return jnp.matmul(attn, v)
+
+    def _rotary_cos_sin(self, L: int, offset: int, dtype):
+        """Compute rotary cos/sin tables for sequence length L starting at offset."""
+
+        ro_dim = self.rotary_emb_dim
+        assert ro_dim % 2 == 0 and ro_dim <= self.head_dim
+        inv_freq = 1.0 / (
+            self.rotary_base ** (jnp.arange(0, ro_dim, 2, dtype=jnp.float32) / ro_dim)
+        )
+        t = jnp.arange(offset, offset + L, dtype=jnp.float32)
+        freqs = jnp.outer(t, inv_freq)  # (L, ro_dim/2)
+        cos = jnp.cos(freqs).astype(dtype)
+        sin = jnp.sin(freqs).astype(dtype)
+        return cos, sin
+
+    def _apply_rotary(self, q: jnp.ndarray, k: jnp.ndarray, offset: int = 0):
+        if self.rotary_emb_dim <= 0:
+            return q, k
+        B, H, L, Dh = q.shape
+        ro_dim = self.rotary_emb_dim
+        cos, sin = self._rotary_cos_sin(L, offset, q.dtype)
+        cos = cos.reshape(1, 1, L, -1)
+        sin = sin.reshape(1, 1, L, -1)
+
+        def rotate_half(x):
+            x1, x2 = jnp.split(x, 2, axis=-1)
+            xr1 = x1 * cos - x2 * sin
+            xr2 = x2 * cos + x1 * sin
+            return jnp.concatenate([xr1, xr2], axis=-1)
+
+        def apply(x):
+            x_ro = x[..., :ro_dim]
+            x_rest = x[..., ro_dim:]
+            x_ro_new = rotate_half(x_ro)
+            return jnp.concatenate([x_ro_new, x_rest], axis=-1)
+
+        return apply(q), apply(k)
 
     def __call__(
         self,
-        x: jax.Array,
-        cache: AttentionCacheState | None = None,
-        cu_seqlens: jax.Array | None = None,
+        x: jnp.ndarray,
+        cu_seqlens: jnp.ndarray | None = None,
         max_seqlen: int | None = None,
-        **kwargs,
-    ) -> tuple[jax.Array, AttentionCacheState | None]:
-        """
-        Forward pass of Causal MHA.
+        attn_mask: jnp.ndarray | None = None,
+        inference_params=None,
+    ) -> jnp.ndarray:
+        packed = cu_seqlens is not None and max_seqlen is not None
+        if packed:
+            assert cu_seqlens is not None and max_seqlen is not None
+            T, D = x.shape
+            B = len(cu_seqlens) - 1
+            Lmax = int(max_seqlen)
+            padded = jnp.zeros((B, Lmax, D), dtype=x.dtype)
+            mask = jnp.zeros((B, Lmax), dtype=jnp.bool_)
 
-        Args:
-            x: Input tensor of shape (batch, seqlen, d_model)
-            cache: Optional attention cache state
-            cu_seqlens: Not yet supported
-            max_seqlen: Not yet supported
+            for b in range(B):
+                s, e = int(cu_seqlens[b]), int(cu_seqlens[b + 1])
+                L = e - s
+                padded = padded.at[b, :L].set(x[s:e])
+                mask = mask.at[b, :L].set(True)
 
-        Returns:
-            output: Output tensor of shape (batch, seqlen, d_model)
-            updated_cache: Updated cache state (if cache was provided)
-        """
-        if cu_seqlens is not None:
-            raise NotImplementedError(
-                "Packed sequence support not yet implemented in JAX version"
+            out = self._forward_padded(padded, attn_mask=mask, inference_params=None)
+            parts = []
+            for b in range(B):
+                L = int(jnp.sum(mask[b]))
+                parts.append(out[b, :L])
+            return jnp.concatenate(parts, axis=0)
+        else:
+            assert x.ndim == 3 and attn_mask is not None, (
+                "Provide attn_mask for padded input"
+            )
+            return self._forward_padded(
+                x, attn_mask=attn_mask, inference_params=inference_params
             )
 
-        batch_size, seqlen, _ = x.shape
+    def _forward_padded(
+        self, x: jnp.ndarray, attn_mask: jnp.ndarray | None, inference_params=None
+    ) -> jnp.ndarray:
+        B, L, _ = x.shape
+        x_dtype = x.dtype
+        w_dtype = self.Wqkv.kernel.value.dtype
+        if x_dtype != w_dtype:
+            x = x.astype(w_dtype)
 
-        # Project to QKV
+        qkv = self.Wqkv(x)  # (B, L, 3D)
+        q, k, v = jnp.split(qkv, 3, axis=-1)
+        q = self._split_heads(q)  # (B, H, L, Dh)
+        k = self._split_heads(k)
+        v = self._split_heads(v)
+
+        if self.rotary_emb_dim > 0:
+            offset = int(getattr(inference_params, "seqlen_offset", 0) or 0)
+            q, k = self._apply_rotary(q, k, offset=offset)
+
+        ctx = self._causal_attn(q, k, v, attn_mask)  # (B, H, L, Dh)
+        ctx = self._merge_heads(ctx)  # (B, L, D)
+        out = self.out_proj(ctx)
+
+        if inference_params is not None:
+            assert getattr(self, "layer_idx", None) is not None, (
+                "layer_idx required for KV cache"
+            )
+            kv_cache = inference_params.key_value_memory_dict.get(self.layer_idx)
+            if kv_cache is None:
+                dtype = self.out_proj.kernel.value.dtype
+                kv_cache = jnp.zeros(
+                    (
+                        inference_params.max_batch_size,
+                        inference_params.max_seqlen,
+                        2,
+                        self.num_heads,
+                        self.head_dim,
+                    ),
+                    dtype=dtype,
+                )
+                inference_params.key_value_memory_dict[self.layer_idx] = kv_cache
+
+            batch_start = inference_params.batch_size_offset
+            batch_end = batch_start + B
+            seq_start = inference_params.seqlen_offset
+            seq_end = seq_start + L
+            kv_cur = jnp.stack(
+                [k.transpose(0, 2, 1, 3), v.transpose(0, 2, 1, 3)], axis=2
+            )  # (B, L, 2, H, Dh)
+            kv_cache = kv_cache.at[batch_start:batch_end, seq_start:seq_end, ...].set(
+                kv_cur
+            )
+            inference_params.key_value_memory_dict[self.layer_idx] = kv_cache
+
+        return out.astype(x_dtype)
+
+    def allocate_inference_cache(self, batch_size: int, max_seqlen: int, dtype=None):
+        return None
+
+    def step(self, x: jnp.ndarray, inference_params=None) -> jnp.ndarray:
+        assert x.ndim == 3 and x.shape[1] == 1
+        B, L, _ = x.shape
+        x_dtype = x.dtype
+        w_dtype = self.Wqkv.kernel.value.dtype
+        if x_dtype != w_dtype:
+            x = x.astype(w_dtype)
+
         qkv = self.Wqkv(x)
-        qkv = rearrange(
-            qkv, "b s (three h d) -> b s three h d", three=3, d=self.head_dim
+        q, k, v = jnp.split(qkv, 3, axis=-1)
+        q = self._split_heads(q)
+        k = self._split_heads(k)
+        v = self._split_heads(v)
+
+        if self.rotary_emb_dim > 0:
+            offset = int(getattr(inference_params, "seqlen_offset", 0) or 0)
+            q, k = self._apply_rotary(q, k, offset=offset)
+
+        assert getattr(self, "layer_idx", None) is not None, (
+            "layer_idx required for KV cache"
+        )
+        kv_cache = inference_params.key_value_memory_dict.get(self.layer_idx)
+        if kv_cache is None:
+            dtype = self.out_proj.kernel.value.dtype
+            kv_cache = jnp.zeros(
+                (
+                    inference_params.max_batch_size,
+                    inference_params.max_seqlen,
+                    2,
+                    self.num_heads,
+                    self.head_dim,
+                ),
+                dtype=dtype,
+            )
+            inference_params.key_value_memory_dict[self.layer_idx] = kv_cache
+
+        batch_start = inference_params.batch_size_offset
+        batch_end = batch_start + B
+        seq_start = inference_params.seqlen_offset
+        seq_end = seq_start + 1
+
+        kv_cache = kv_cache.at[batch_start:batch_end, seq_start:seq_end, 0, ...].set(
+            k.transpose(0, 2, 1, 3)
+        )
+        kv_cache = kv_cache.at[batch_start:batch_end, seq_start:seq_end, 1, ...].set(
+            v.transpose(0, 2, 1, 3)
+        )
+        inference_params.key_value_memory_dict[self.layer_idx] = kv_cache
+
+        start = (
+            max(0, seq_end - self.window_size)
+            if (self.window_size is not None and self.window_size > 0)
+            else 0
+        )
+        K_all = kv_cache[batch_start:batch_end, start:seq_end, 0, ...].transpose(
+            0, 2, 1, 3
+        )
+        V_all = kv_cache[batch_start:batch_end, start:seq_end, 1, ...].transpose(
+            0, 2, 1, 3
         )
 
-        # Apply rotary embeddings if enabled
-        if self.rotary_emb is not None:
-            seqlen_offset = cache.cached_len if cache is not None else 0
-            qkv = self.rotary_emb(qkv, seqlen_offset=seqlen_offset)
-
-        # Handle inference mode with KV caching
-        if cache is not None and cache.cached_len > 0:
-            # We're in generation mode
-            assert isinstance(qkv, jax.Array), "qkv must be a JAX array"
-            q = qkv[:, :, 0]  # (batch, seqlen, nheads, head_dim)
-            kv_new = qkv[:, :, 1:]  # (batch, seqlen, 2, nheads, head_dim)
-
-            # Update KV cache
-            k_new = kv_new[:, :, 0]  # (batch, seqlen, nheads, head_dim)
-            v_new = kv_new[:, :, 1]  # (batch, seqlen, nheads, head_dim)
-
-            # Update cache arrays
-            new_k_cache = cache.key_cache.at[
-                :batch_size, cache.cached_len : cache.cached_len + seqlen
-            ].set(k_new)
-            new_v_cache = cache.value_cache.at[
-                :batch_size, cache.cached_len : cache.cached_len + seqlen
-            ].set(v_new)
-
-            # Create updated cache state
-            updated_cache = AttentionCacheState(
-                key_cache=new_k_cache,
-                value_cache=new_v_cache,
-                cached_len=cache.cached_len + seqlen,
-            )
-
-            # Get cached KV up to current position
-            kv_cache = jnp.stack(
-                [
-                    updated_cache.key_cache[:batch_size, : updated_cache.cached_len],
-                    updated_cache.value_cache[:batch_size, : updated_cache.cached_len],
-                ],
-                axis=2,
-            )
-
-            # Cross attention with cached KV
-            context = self.inner_cross_attn(q, kv_cache)
-        else:
-            # Standard self-attention
-            assert isinstance(qkv, jax.Array), "qkv must be a JAX array"
-            context = self.inner_attn(qkv)
-
-            # If cache is provided but empty, initialize it
-            if cache is not None:
-                k = qkv[:, :, 1]  # (batch, seqlen, nheads, head_dim)
-                v = qkv[:, :, 2]  # (batch, seqlen, nheads, head_dim)
-
-                # Update cache arrays
-                new_k_cache = cache.key_cache.at[:batch_size, :seqlen].set(k)
-                new_v_cache = cache.value_cache.at[:batch_size, :seqlen].set(v)
-
-                updated_cache = AttentionCacheState(
-                    key_cache=new_k_cache, value_cache=new_v_cache, cached_len=seqlen
-                )
-            else:
-                updated_cache = None
-
-        # Project output
-        assert isinstance(context, jax.Array), "context must be a JAX array"
-        out = self.out_proj(rearrange(context, "b s h d -> b s (h d)"))
-
-        return out, updated_cache
-
-    def step(
-        self, x: jax.Array, cache: AttentionCacheState
-    ) -> tuple[jax.Array, AttentionCacheState]:
-        """Single step for autoregressive generation."""
-        out, updated_cache = self(x, cache=cache)
-        assert updated_cache is not None, "Cache must be provided for step mode"
-        return out, updated_cache
+        scale = self.head_dim**-0.5
+        attn_scores = jnp.matmul(q, K_all.transpose(0, 1, 3, 2)) * scale
+        attn = jax.nn.softmax(attn_scores, axis=-1)
+        ctx = jnp.matmul(attn, V_all)
+        ctx = self._merge_heads(ctx)
+        out = self.out_proj(ctx)
+        return out.astype(x_dtype)

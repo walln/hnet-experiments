@@ -23,14 +23,11 @@ Notes:
 
 from __future__ import annotations
 
-import math
-from dataclasses import dataclass, field, asdict
-from typing import Dict, List, Optional, Tuple, Union
+from dataclasses import asdict, dataclass, field
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
 
 # ============================
 # Utilities and Configs
@@ -49,14 +46,16 @@ def get_seq_idx(cu_seqlens: torch.Tensor, device=None) -> torch.Tensor:
 
 
 def get_stage_cfg(cfg, stage_idx: int):
-    return {k: (v[stage_idx] if isinstance(v, list) else v) for k, v in asdict(cfg).items()}
+    return {
+        k: (v[stage_idx] if isinstance(v, list) else v) for k, v in asdict(cfg).items()
+    }
 
 
 @dataclass
 class AttnConfig:
-    num_heads: List[int] = field(default_factory=list)
-    rotary_emb_dim: List[int] = field(default_factory=list)
-    window_size: List[int] = field(default_factory=list)
+    num_heads: list[int] = field(default_factory=list)
+    rotary_emb_dim: list[int] = field(default_factory=list)
+    window_size: list[int] = field(default_factory=list)
 
 
 @dataclass
@@ -69,9 +68,9 @@ class SSMConfig:
 
 @dataclass
 class HNetConfig:
-    arch_layout: List[Union[str, List]] = field(default_factory=list)
-    d_model: List[int] = field(default_factory=list)
-    d_intermediate: List[int] = field(default_factory=list)
+    arch_layout: list[str | list] = field(default_factory=list)
+    d_model: list[int] = field(default_factory=list)
+    d_intermediate: list[int] = field(default_factory=list)
     vocab_size: int = 256
     ssm_cfg: SSMConfig = field(default_factory=SSMConfig)
     attn_cfg: AttnConfig = field(default_factory=AttnConfig)
@@ -92,7 +91,7 @@ class RMSNorm(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        residual: Optional[torch.Tensor] = None,
+        residual: torch.Tensor | None = None,
         prenorm: bool = False,
         residual_in_fp32: bool = False,
     ):
@@ -101,10 +100,18 @@ class RMSNorm(nn.Module):
                 residual = residual.to(torch.float32)
             x = (x + residual).to(x.dtype)
         if prenorm:
-            normed = x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps) * self.weight
+            normed = (
+                x
+                * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
+                * self.weight
+            )
             return normed, x
         else:
-            return x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps) * self.weight
+            return (
+                x
+                * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
+                * self.weight
+            )
 
 
 class SwiGLU(nn.Module):
@@ -141,7 +148,7 @@ class CausalMHA(nn.Module):
         window_size: int = -1,
         device=None,
         dtype=None,
-        layer_idx: Optional[int] = None,
+        layer_idx: int | None = None,
     ) -> None:
         super().__init__()
         self.d_model = d_model
@@ -154,8 +161,12 @@ class CausalMHA(nn.Module):
         self.window_size = int(window_size) if window_size is not None else -1
         factory_kwargs = {"device": device, "dtype": dtype}
 
-        self.Wqkv = nn.Linear(d_model, 3 * d_model, bias=qkv_proj_bias, **factory_kwargs)
-        self.out_proj = nn.Linear(d_model, d_model, bias=out_proj_bias, **factory_kwargs)
+        self.Wqkv = nn.Linear(
+            d_model, 3 * d_model, bias=qkv_proj_bias, **factory_kwargs
+        )
+        self.out_proj = nn.Linear(
+            d_model, d_model, bias=out_proj_bias, **factory_kwargs
+        )
 
     def _split_heads(self, x: torch.Tensor) -> torch.Tensor:
         return x.view(*x.shape[:-1], self.num_heads, self.head_dim).transpose(1, 2)
@@ -164,13 +175,19 @@ class CausalMHA(nn.Module):
         return x.transpose(1, 2).contiguous().view(x.size(0), x.size(2), self.d_model)
 
     def _causal_attn(
-        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, attn_mask: Optional[torch.Tensor]
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        attn_mask: torch.Tensor | None,
     ) -> torch.Tensor:
         # q, k, v: (B, H, L, D)
-        scale = self.head_dim ** -0.5
+        scale = self.head_dim**-0.5
         attn_scores = torch.matmul(q, k.transpose(-2, -1)) * scale  # (B, H, L, L)
         L = q.size(-2)
-        causal = torch.triu(torch.ones(L, L, device=q.device, dtype=torch.bool), diagonal=1)
+        causal = torch.triu(
+            torch.ones(L, L, device=q.device, dtype=torch.bool), diagonal=1
+        )
         attn_scores.masked_fill_(causal, float("-inf"))
         if self.window_size is not None and self.window_size > 0:
             # Disallow keys older than window_size
@@ -192,7 +209,8 @@ class CausalMHA(nn.Module):
         ro_dim = self.rotary_emb_dim
         assert ro_dim % 2 == 0 and ro_dim <= self.head_dim
         inv_freq = 1.0 / (
-            self.rotary_base ** (torch.arange(0, ro_dim, 2, device=device, dtype=torch.float32) / ro_dim)
+            self.rotary_base
+            ** (torch.arange(0, ro_dim, 2, device=device, dtype=torch.float32) / ro_dim)
         )
         # positions [offset, offset+L-1]
         t = torch.arange(offset, offset + L, device=device, dtype=torch.float32)
@@ -213,24 +231,27 @@ class CausalMHA(nn.Module):
         # shape to (1,1,L,ro_dim/2) for broadcast
         cos = cos.view(1, 1, L, -1)
         sin = sin.view(1, 1, L, -1)
+
         def rotate_half(x):
             x1, x2 = x.chunk(2, dim=-1)  # (..., ro_dim/2)
             xr1 = x1 * cos - x2 * sin
             xr2 = x2 * cos + x1 * sin
             return torch.cat([xr1, xr2], dim=-1)
+
         def apply(x):
             x_ro = x[..., :ro_dim]
             x_rest = x[..., ro_dim:]
             x_ro_new = rotate_half(x_ro)
             return torch.cat([x_ro_new, x_rest], dim=-1)
+
         return apply(q), apply(k)
 
     def forward(
         self,
         x: torch.Tensor,
-        cu_seqlens: Optional[torch.Tensor] = None,
-        max_seqlen: Optional[int] = None,
-        attn_mask: Optional[torch.Tensor] = None,
+        cu_seqlens: torch.Tensor | None = None,
+        max_seqlen: int | None = None,
+        attn_mask: torch.Tensor | None = None,
         inference_params=None,
     ) -> torch.Tensor:
         # Support either packed (T, D) with cu_seqlens+max_seqlen or padded (B, L, D) with attn_mask.
@@ -256,10 +277,16 @@ class CausalMHA(nn.Module):
                 parts.append(out[b, :L])
             return torch.cat(parts, dim=0)
         else:
-            assert x.dim() == 3 and attn_mask is not None, "Provide attn_mask for padded input"
-            return self._forward_padded(x, attn_mask=attn_mask, inference_params=inference_params)
+            assert x.dim() == 3 and attn_mask is not None, (
+                "Provide attn_mask for padded input"
+            )
+            return self._forward_padded(
+                x, attn_mask=attn_mask, inference_params=inference_params
+            )
 
-    def _forward_padded(self, x: torch.Tensor, attn_mask: Optional[torch.Tensor], inference_params=None) -> torch.Tensor:
+    def _forward_padded(
+        self, x: torch.Tensor, attn_mask: torch.Tensor | None, inference_params=None
+    ) -> torch.Tensor:
         B, L, _ = x.shape
         x_dtype = x.dtype
         w_dtype = self.Wqkv.weight.dtype
@@ -279,7 +306,9 @@ class CausalMHA(nn.Module):
         out = self.out_proj(ctx)
         # Write K/V to cache during prefill if inference_params provided
         if inference_params is not None:
-            assert getattr(self, "layer_idx", None) is not None, "layer_idx required for KV cache"
+            assert getattr(self, "layer_idx", None) is not None, (
+                "layer_idx required for KV cache"
+            )
             # lazy-allocate cache
             kv_cache = inference_params.key_value_memory_dict.get(self.layer_idx)
             if kv_cache is None:
@@ -299,7 +328,9 @@ class CausalMHA(nn.Module):
             batch_end = batch_start + B
             seq_start = inference_params.seqlen_offset
             seq_end = seq_start + L
-            kv_cur = torch.stack([k.transpose(1, 2), v.transpose(1, 2)], dim=2)  # (B, L, 2, H, Dh)
+            kv_cur = torch.stack(
+                [k.transpose(1, 2), v.transpose(1, 2)], dim=2
+            )  # (B, L, 2, H, Dh)
             kv_cache[batch_start:batch_end, seq_start:seq_end, ...] = kv_cur
         return out.to(x_dtype)
 
@@ -324,7 +355,9 @@ class CausalMHA(nn.Module):
             offset = int(getattr(inference_params, "seqlen_offset", 0) or 0)
             q, k = self._apply_rotary(q, k, offset=offset)
         # Lazy-allocate / fetch KV cache
-        assert getattr(self, "layer_idx", None) is not None, "layer_idx required for KV cache"
+        assert getattr(self, "layer_idx", None) is not None, (
+            "layer_idx required for KV cache"
+        )
         kv_cache = inference_params.key_value_memory_dict.get(self.layer_idx)
         if kv_cache is None:
             dtype = self.out_proj.weight.dtype
@@ -344,14 +377,24 @@ class CausalMHA(nn.Module):
         seq_start = inference_params.seqlen_offset
         seq_end = seq_start + 1
         # Write current K/V
-        kv_cache[batch_start:batch_end, seq_start:seq_end, 0, ...] = k.transpose(1, 2)  # K
-        kv_cache[batch_start:batch_end, seq_start:seq_end, 1, ...] = v.transpose(1, 2)  # V
+        kv_cache[batch_start:batch_end, seq_start:seq_end, 0, ...] = k.transpose(
+            1, 2
+        )  # K
+        kv_cache[batch_start:batch_end, seq_start:seq_end, 1, ...] = v.transpose(
+            1, 2
+        )  # V
         # Read past K/V up to seq_end, with optional windowing
-        start = max(0, seq_end - self.window_size) if (self.window_size is not None and self.window_size > 0) else 0
-        K_all = kv_cache[batch_start:batch_end, start:seq_end, 0, ...].transpose(1, 2)  # (B, H, S, Dh)
+        start = (
+            max(0, seq_end - self.window_size)
+            if (self.window_size is not None and self.window_size > 0)
+            else 0
+        )
+        K_all = kv_cache[batch_start:batch_end, start:seq_end, 0, ...].transpose(
+            1, 2
+        )  # (B, H, S, Dh)
         V_all = kv_cache[batch_start:batch_end, start:seq_end, 1, ...].transpose(1, 2)
         # Attention over full prefix
-        scale = self.head_dim ** -0.5
+        scale = self.head_dim**-0.5
         attn_scores = torch.matmul(q, K_all.transpose(-2, -1)) * scale  # (B, H, 1, S)
         attn = torch.softmax(attn_scores, dim=-1)
         ctx = torch.matmul(attn, V_all)  # (B, H, 1, Dh)
@@ -375,7 +418,7 @@ class PyTorchSSM(nn.Module):
         headdim: int = 64,
         device=None,
         dtype=None,
-        layer_idx: Optional[int] = None,
+        layer_idx: int | None = None,
     ):
         super().__init__()
         self.d_model = d_model
@@ -409,7 +452,12 @@ class PyTorchSSM(nn.Module):
         self.A_log = nn.Parameter(torch.zeros(self.nheads, **factory_kwargs))
         self.D = nn.Parameter(torch.ones(self.nheads, **factory_kwargs))
 
-    def forward(self, x: torch.Tensor, seq_idx: Optional[torch.Tensor] = None, inference_params=None) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        seq_idx: torch.Tensor | None = None,
+        inference_params=None,
+    ) -> torch.Tensor:
         # x: (B, L, D)
         B, L, D = x.shape
         x_dtype = x.dtype
@@ -426,7 +474,9 @@ class PyTorchSSM(nn.Module):
         xBC = F.silu(self.conv1d(xBC.transpose(1, 2)).transpose(1, 2))
         if xBC.shape[1] != L:
             xBC = xBC[:, :L, :]
-        x_part, B_part, C_part = torch.split(xBC, [self.d_inner, self.d_state, self.d_state], dim=-1)
+        x_part, B_part, C_part = torch.split(
+            xBC, [self.d_inner, self.d_state, self.d_state], dim=-1
+        )
 
         # Heads view
         x_heads = x_part.view(B, L, self.nheads, self.headdim)
@@ -436,21 +486,29 @@ class PyTorchSSM(nn.Module):
         A = -torch.exp(self.A_log)  # (H,)
 
         # Stateful scan (naive O(L * H * P * S))
-        state = torch.zeros(B, self.nheads, self.headdim, self.d_state, device=x.device, dtype=w_dtype)
-        y_acc = torch.zeros(B, L, self.nheads, self.headdim, device=x.device, dtype=w_dtype)
+        state = torch.zeros(
+            B, self.nheads, self.headdim, self.d_state, device=x.device, dtype=w_dtype
+        )
+        y_acc = torch.zeros(
+            B, L, self.nheads, self.headdim, device=x.device, dtype=w_dtype
+        )
         for t in range(L):
             dt_t = dt[:, t]  # (B, H)
             decay = torch.exp(A.unsqueeze(0) * dt_t)  # (B, H)
             state = state * decay.unsqueeze(-1).unsqueeze(-1)
             x_t = x_heads[:, t]  # (B, H, P)
             B_t = B_heads[:, t]  # (B, H, S)
-            state = state + (x_t.unsqueeze(-1) * B_t.unsqueeze(-2)) * dt_t.unsqueeze(-1).unsqueeze(-1)
+            state = state + (x_t.unsqueeze(-1) * B_t.unsqueeze(-2)) * dt_t.unsqueeze(
+                -1
+            ).unsqueeze(-1)
             C_t = C_heads[:, t]
             y_t = (state * C_t.unsqueeze(-2)).sum(dim=-1)  # (B, H, P)
             y_acc[:, t] = y_t
 
         y = y_acc.reshape(B, L, self.d_inner)
-        D_full = self.D.unsqueeze(-1).expand(self.nheads, self.headdim).reshape(1, 1, -1)
+        D_full = (
+            self.D.unsqueeze(-1).expand(self.nheads, self.headdim).reshape(1, 1, -1)
+        )
         y = y + x_part * D_full
         y = self.norm(y * F.silu(z))
         out = self.out_proj(y)
@@ -474,13 +532,22 @@ class PyTorchSSM(nn.Module):
             dim=-1,
         )
         # Cache states
-        layer_idx = getattr(self, 'layer_idx', None)
+        layer_idx = getattr(self, "layer_idx", None)
         assert layer_idx is not None and inference_params is not None
         cache = inference_params.key_value_memory_dict
         conv_dim = self.d_inner + 2 * self.d_state
         if layer_idx not in cache:
-            conv_state = torch.zeros(B, conv_dim, self.conv1d.kernel_size[0], device=x.device, dtype=w_dtype)
-            ssm_state = torch.zeros(B, self.nheads, self.headdim, self.d_state, device=x.device, dtype=w_dtype)
+            conv_state = torch.zeros(
+                B, conv_dim, self.conv1d.kernel_size[0], device=x.device, dtype=w_dtype
+            )
+            ssm_state = torch.zeros(
+                B,
+                self.nheads,
+                self.headdim,
+                self.d_state,
+                device=x.device,
+                dtype=w_dtype,
+            )
         else:
             conv_state, ssm_state = cache[layer_idx]
             if conv_state.size(0) != B:
@@ -491,11 +558,13 @@ class PyTorchSSM(nn.Module):
         xBC_t = xBC[:, 0]  # (B, conv_dim)
         conv_state = torch.cat([conv_state[:, :, 1:], xBC_t.unsqueeze(-1)], dim=-1)
         w = self.conv1d.weight.squeeze(1)  # (conv_dim, k)
-        conv_out = torch.einsum('bck,ck->bc', conv_state, w)
+        conv_out = torch.einsum("bck,ck->bc", conv_state, w)
         if self.conv1d.bias is not None:
             conv_out = conv_out + self.conv1d.bias
         conv_out = F.silu(conv_out)
-        x_part, B_part, C_part = torch.split(conv_out, [self.d_inner, self.d_state, self.d_state], dim=-1)
+        x_part, B_part, C_part = torch.split(
+            conv_out, [self.d_inner, self.d_state, self.d_state], dim=-1
+        )
         x_heads = x_part.view(B, self.nheads, self.headdim)
         B_t = B_part.unsqueeze(1).expand(-1, self.nheads, -1)
         C_t = C_part.unsqueeze(1).expand(-1, self.nheads, -1)
@@ -503,10 +572,14 @@ class PyTorchSSM(nn.Module):
         A = -torch.exp(self.A_log)
         decay = torch.exp(A.unsqueeze(0) * dt_t)
         ssm_state = ssm_state * decay.unsqueeze(-1).unsqueeze(-1)
-        ssm_state = ssm_state + (x_heads.unsqueeze(-1) * B_t.unsqueeze(-2)) * dt_t.unsqueeze(-1).unsqueeze(-1)
+        ssm_state = ssm_state + (
+            x_heads.unsqueeze(-1) * B_t.unsqueeze(-2)
+        ) * dt_t.unsqueeze(-1).unsqueeze(-1)
         y_t = (ssm_state * C_t.unsqueeze(-2)).sum(dim=-1)  # (B, H, P)
         y = y_t.reshape(B, 1, self.d_inner)
-        D_full = self.D.unsqueeze(-1).expand(self.nheads, self.headdim).reshape(1, 1, -1)
+        D_full = (
+            self.D.unsqueeze(-1).expand(self.nheads, self.headdim).reshape(1, 1, -1)
+        )
         y = y + x_part.view(B, 1, -1) * D_full
         y = self.norm(y * F.silu(z))
         out = self.out_proj(y)
@@ -524,7 +597,7 @@ class Block(nn.Module):
         self,
         d_model: int,
         mixer: nn.Module,
-        mlp: Optional[nn.Module],
+        mlp: nn.Module | None,
         residual_in_fp32: bool = True,
     ):
         super().__init__()
@@ -538,26 +611,44 @@ class Block(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        residual: Optional[torch.Tensor] = None,
+        residual: torch.Tensor | None = None,
         inference_params=None,
-        mixer_kwargs: Optional[Dict] = None,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        x, residual = self.norm1(x, residual=residual, prenorm=True, residual_in_fp32=self.residual_in_fp32)
+        mixer_kwargs: dict | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        x, residual = self.norm1(
+            x, residual=residual, prenorm=True, residual_in_fp32=self.residual_in_fp32
+        )
         mixer_kwargs = mixer_kwargs or {}
         x = self.mixer(x, **mixer_kwargs, inference_params=inference_params)
         if self.mlp is not None:
-            x, residual = self.norm2(x, residual=residual, prenorm=True, residual_in_fp32=self.residual_in_fp32)
+            x, residual = self.norm2(
+                x,
+                residual=residual,
+                prenorm=True,
+                residual_in_fp32=self.residual_in_fp32,
+            )
             x = self.mlp(x)
         return x, residual
 
-    def allocate_inference_cache(self, batch_size: int, max_seqlen: int, dtype=None, **kwargs):
+    def allocate_inference_cache(
+        self, batch_size: int, max_seqlen: int, dtype=None, **kwargs
+    ):
         return None
 
-    def step(self, x: torch.Tensor, inference_params, residual: Optional[torch.Tensor] = None):
-        x, residual = self.norm1(x, residual=residual, prenorm=True, residual_in_fp32=self.residual_in_fp32)
+    def step(
+        self, x: torch.Tensor, inference_params, residual: torch.Tensor | None = None
+    ):
+        x, residual = self.norm1(
+            x, residual=residual, prenorm=True, residual_in_fp32=self.residual_in_fp32
+        )
         x = self.mixer.step(x, inference_params)
         if self.mlp is not None:
-            x, residual = self.norm2(x, residual=residual, prenorm=True, residual_in_fp32=self.residual_in_fp32)
+            x, residual = self.norm2(
+                x,
+                residual=residual,
+                prenorm=True,
+                residual_in_fp32=self.residual_in_fp32,
+            )
             x = self.mlp(x)
         return x, residual
 
@@ -569,7 +660,7 @@ class IsotropicInferenceParams:
     seqlen_offset: int = 0
     batch_size_offset: int = 0
     key_value_memory_dict: dict = field(default_factory=dict)
-    lengths_per_sample: Optional[torch.Tensor] = None
+    lengths_per_sample: torch.Tensor | None = None
 
     def reset(self, max_seqlen: int, max_batch_size: int):
         self.max_seqlen = max_seqlen
@@ -604,7 +695,7 @@ class Isotropic(nn.Module):
         import re
 
         layout_parse = re.findall(r"([mMtT])(\d+)", arch_layout)
-        layers: List[Block] = []
+        layers: list[Block] = []
         layer_idx = 0
         for arch, n_layer_str in layout_parse:
             n_layer = int(n_layer_str)
@@ -631,7 +722,11 @@ class Isotropic(nn.Module):
                     raise NotImplementedError
 
                 if arch in ("T", "M"):
-                    mlp = SwiGLU(self.d_model, d_intermediate=config.d_intermediate[self.stage_idx], **factory_kwargs)
+                    mlp = SwiGLU(
+                        self.d_model,
+                        d_intermediate=config.d_intermediate[self.stage_idx],
+                        **factory_kwargs,
+                    )
                 else:
                     mlp = None
                 layers.append(Block(self.d_model, mixer, mlp))
@@ -641,15 +736,17 @@ class Isotropic(nn.Module):
         self.rmsnorm = RMSNorm(self.d_model, eps=1e-5, **factory_kwargs)
 
     def allocate_inference_cache(self, batch_size: int, max_seqlen: int, dtype=None):
-        return IsotropicInferenceParams(max_seqlen=max_seqlen, max_batch_size=batch_size)
+        return IsotropicInferenceParams(
+            max_seqlen=max_seqlen, max_batch_size=batch_size
+        )
 
     def forward(
         self,
         hidden_states: torch.Tensor,
-        cu_seqlens: Optional[torch.Tensor] = None,
-        max_seqlen: Optional[int] = None,
-        mask: Optional[torch.Tensor] = None,
-        inference_params: Optional[IsotropicInferenceParams] = None,
+        cu_seqlens: torch.Tensor | None = None,
+        max_seqlen: int | None = None,
+        mask: torch.Tensor | None = None,
+        inference_params: IsotropicInferenceParams | None = None,
         **mixer_kwargs,
     ) -> torch.Tensor:
         packed = cu_seqlens is not None and max_seqlen is not None and mask is None
@@ -676,7 +773,12 @@ class Isotropic(nn.Module):
                 mix_kwargs = {"attn_mask": mask_local}
             else:
                 mix_kwargs = {}
-            x, residual = layer(x, residual=residual, inference_params=inference_params, mixer_kwargs=mix_kwargs)
+            x, residual = layer(
+                x,
+                residual=residual,
+                inference_params=inference_params,
+                mixer_kwargs=mix_kwargs,
+            )
 
         x = self.rmsnorm(x, residual=residual, prenorm=False, residual_in_fp32=True)
 
@@ -689,14 +791,20 @@ class Isotropic(nn.Module):
 
         if inference_params is not None:
             # Follow reference: assert batch size 1 and padded path when tracking seqlen_offset
-            assert mask is not None, "Mask must be provided if inference_params is provided"
+            assert mask is not None, (
+                "Mask must be provided if inference_params is provided"
+            )
             assert mask.shape[0] == 1, "seqlen_offset handling assumes batch size 1"
-            assert x.dim() == 3, "Inference with inference_params expects padded (B, L, D)"
+            assert x.dim() == 3, (
+                "Inference with inference_params expects padded (B, L, D)"
+            )
             inference_params.seqlen_offset += x.shape[1]
 
         return x
 
-    def step(self, hidden_states: torch.Tensor, inference_params: IsotropicInferenceParams):
+    def step(
+        self, hidden_states: torch.Tensor, inference_params: IsotropicInferenceParams
+    ):
         residual = None
         x = hidden_states
         for layer in self.layers:
@@ -737,39 +845,52 @@ class RoutingModule(nn.Module):
         self.q_proj_layer = nn.Linear(d_model, d_model, bias=False, **factory_kwargs)
         self.k_proj_layer = nn.Linear(d_model, d_model, bias=False, **factory_kwargs)
         with torch.no_grad():
-            self.q_proj_layer.weight.copy_(torch.eye(d_model, device=self.q_proj_layer.weight.device))
-            self.k_proj_layer.weight.copy_(torch.eye(d_model, device=self.k_proj_layer.weight.device))
+            self.q_proj_layer.weight.copy_(
+                torch.eye(d_model, device=self.q_proj_layer.weight.device)
+            )
+            self.k_proj_layer.weight.copy_(
+                torch.eye(d_model, device=self.k_proj_layer.weight.device)
+            )
         self.q_proj_layer.weight._no_reinit = True
         self.k_proj_layer.weight._no_reinit = True
 
-    def allocate_inference_cache(self, batch_size: int, max_seqlen: int, device, dtype=None):
+    def allocate_inference_cache(
+        self, batch_size: int, max_seqlen: int, device, dtype=None
+    ):
         return RoutingModuleState(
             has_seen_tokens=torch.zeros(batch_size, device=device, dtype=torch.bool),
-            last_hidden_state=torch.zeros(batch_size, self.d_model, device=device, dtype=dtype),
+            last_hidden_state=torch.zeros(
+                batch_size, self.d_model, device=device, dtype=dtype
+            ),
         )
 
     def forward(
         self,
         hidden_states: torch.Tensor,
-        cu_seqlens: Optional[torch.Tensor] = None,
-        mask: Optional[torch.Tensor] = None,
-        inference_params: Optional[RoutingModuleState] = None,
+        cu_seqlens: torch.Tensor | None = None,
+        mask: torch.Tensor | None = None,
+        inference_params: RoutingModuleState | None = None,
     ) -> RoutingModuleOutput:
-        assert (mask is not None) or (cu_seqlens is not None), "Provide mask or cu_seqlens"
+        assert (mask is not None) or (cu_seqlens is not None), (
+            "Provide mask or cu_seqlens"
+        )
         if inference_params is not None:
             # Match reference behavior: prefill requires mask and unseen state
-            assert mask is not None, "Mask must be provided if inference_params is provided"
-            assert (
-                (~inference_params.has_seen_tokens).all()
-            ), "Cannot have seen tokens when inference_params is provided"
+            assert mask is not None, (
+                "Mask must be provided if inference_params is provided"
+            )
+            assert (~inference_params.has_seen_tokens).all(), (
+                "Cannot have seen tokens when inference_params is provided"
+            )
             # Not supporting packed + inference_params
-            assert cu_seqlens is None, "Packed mode with inference_params is not supported"
+            assert cu_seqlens is None, (
+                "Packed mode with inference_params is not supported"
+            )
 
-        if cu_seqlens is not None:
-            # Treat as single batch for computation convenience
-            hs = hidden_states.unsqueeze(0)  # (1, T, D)
-        else:
-            hs = hidden_states  # (B, L, D)
+        # Treat as single batch for computation convenience
+        # if cu_seqlens is not None, then hidden_states is (B, L, D)
+        # otherwise, hidden_states is (B, L, D)
+        hs = hidden_states.unsqueeze(0) if cu_seqlens is not None else hidden_states
 
         # Ensure dtype matches projection weights
         hs_dtype = hs.dtype
@@ -798,7 +919,9 @@ class RoutingModule(nn.Module):
         if inference_params is not None:
             # Update prefill state so that step() has correct previous token context
             has_mask = mask.any(dim=-1)
-            inference_params.has_seen_tokens.copy_(has_mask | inference_params.has_seen_tokens)
+            inference_params.has_seen_tokens.copy_(
+                has_mask | inference_params.has_seen_tokens
+            )
             last_mask = torch.clamp(mask.sum(dim=-1) - 1, min=0)
             idx_b = torch.arange(hidden_states.shape[0], device=hidden_states.device)
             last_h = hidden_states[idx_b, last_mask]
@@ -810,9 +933,15 @@ class RoutingModule(nn.Module):
                 )
             )
         selected_probs = boundary_prob.gather(dim=-1, index=selected_idx.unsqueeze(-1))
-        return RoutingModuleOutput(boundary_prob=boundary_prob, boundary_mask=boundary_mask, selected_probs=selected_probs)
+        return RoutingModuleOutput(
+            boundary_prob=boundary_prob,
+            boundary_mask=boundary_mask,
+            selected_probs=selected_probs,
+        )
 
-    def step(self, hidden_states: torch.Tensor, inference_params: RoutingModuleState) -> RoutingModuleOutput:
+    def step(
+        self, hidden_states: torch.Tensor, inference_params: RoutingModuleState
+    ) -> RoutingModuleOutput:
         # hidden_states: (B, 1, D)
         hs = hidden_states.squeeze(1)
         # Align dtype to projection weights
@@ -827,13 +956,23 @@ class RoutingModule(nn.Module):
         )
         boundary_prob = torch.clamp(((1 - cos_sim) / 2), min=0.0, max=1.0)
         inference_params.last_hidden_state.copy_(hs)
-        boundary_prob = torch.where(inference_params.has_seen_tokens, boundary_prob, torch.ones_like(boundary_prob))
+        boundary_prob = torch.where(
+            inference_params.has_seen_tokens,
+            boundary_prob,
+            torch.ones_like(boundary_prob),
+        )
         boundary_prob = torch.stack(((1 - boundary_prob), boundary_prob), dim=-1)
-        inference_params.has_seen_tokens.copy_(torch.ones_like(inference_params.has_seen_tokens))
+        inference_params.has_seen_tokens.copy_(
+            torch.ones_like(inference_params.has_seen_tokens)
+        )
         # Match reference: threshold 0.5 for boundary
         boundary_mask = boundary_prob[..., 1] > 0.5
         selected_probs = boundary_prob.max(dim=-1).values.unsqueeze(-1)
-        return RoutingModuleOutput(boundary_prob=boundary_prob, boundary_mask=boundary_mask, selected_probs=selected_probs)
+        return RoutingModuleOutput(
+            boundary_prob=boundary_prob,
+            boundary_mask=boundary_mask,
+            selected_probs=selected_probs,
+        )
 
 
 class ChunkLayer(nn.Module):
@@ -841,13 +980,17 @@ class ChunkLayer(nn.Module):
         self,
         hidden_states: torch.Tensor,
         boundary_mask: torch.Tensor,
-        cu_seqlens: Optional[torch.Tensor] = None,
-        mask: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[int], Optional[torch.Tensor]]:
-        assert (mask is not None) or (cu_seqlens is not None), "Provide mask or cu_seqlens"
+        cu_seqlens: torch.Tensor | None = None,
+        mask: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None, int | None, torch.Tensor | None]:
+        assert (mask is not None) or (cu_seqlens is not None), (
+            "Provide mask or cu_seqlens"
+        )
         if cu_seqlens is not None:
             next_hidden_states = hidden_states[boundary_mask]
-            next_cu_seqlens = F.pad(boundary_mask.cumsum(dim=0)[cu_seqlens[1:] - 1], (1, 0))
+            next_cu_seqlens = F.pad(
+                boundary_mask.cumsum(dim=0)[cu_seqlens[1:] - 1], (1, 0)
+            )
             next_max_seqlen = int((next_cu_seqlens[1:] - next_cu_seqlens[:-1]).max())
             next_mask = None
         else:
@@ -856,18 +999,27 @@ class ChunkLayer(nn.Module):
             next_max_seqlen = int(num_tokens.max())
             device = hidden_states.device
             L = hidden_states.shape[1]
-            token_idx = torch.arange(L, device=device)[None, :] + (~boundary_mask).long() * L
+            token_idx = (
+                torch.arange(L, device=device)[None, :] + (~boundary_mask).long() * L
+            )
             seq_sorted_indices = torch.argsort(token_idx, dim=1)
             next_hidden_states = torch.gather(
                 hidden_states,
                 dim=1,
-                index=seq_sorted_indices[:, :next_max_seqlen, None].expand(-1, -1, hidden_states.shape[-1]),
+                index=seq_sorted_indices[:, :next_max_seqlen, None].expand(
+                    -1, -1, hidden_states.shape[-1]
+                ),
             )
-            next_mask = (torch.arange(next_max_seqlen, device=device)[None, :] < num_tokens[:, None])
+            next_mask = (
+                torch.arange(next_max_seqlen, device=device)[None, :]
+                < num_tokens[:, None]
+            )
             next_max_seqlen = None
         return next_hidden_states, next_cu_seqlens, next_max_seqlen, next_mask
 
-    def step(self, hidden_states: torch.Tensor, boundary_mask: torch.Tensor) -> torch.Tensor:
+    def step(
+        self, hidden_states: torch.Tensor, boundary_mask: torch.Tensor
+    ) -> torch.Tensor:
         return hidden_states[boundary_mask]
 
 
@@ -876,8 +1028,12 @@ class DeChunkLayer(nn.Module):
         super().__init__()
         self.d_model = d_model
 
-    def allocate_inference_cache(self, batch_size: int, max_seqlen: int, device, dtype=None):
-        return DeChunkState(last_value=torch.zeros(batch_size, self.d_model, device=device, dtype=dtype))
+    def allocate_inference_cache(
+        self, batch_size: int, max_seqlen: int, device, dtype=None
+    ):
+        return DeChunkState(
+            last_value=torch.zeros(batch_size, self.d_model, device=device, dtype=dtype)
+        )
 
     @staticmethod
     def _ema_sequence(hidden_seq: torch.Tensor, p_seq: torch.Tensor) -> torch.Tensor:
@@ -899,13 +1055,17 @@ class DeChunkLayer(nn.Module):
         hidden_states: torch.Tensor,
         boundary_mask: torch.Tensor,
         boundary_prob: torch.Tensor,
-        cu_seqlens: Optional[torch.Tensor] = None,
-        inference_params: Optional[DeChunkState] = None,
-        mask: Optional[torch.Tensor] = None,
+        cu_seqlens: torch.Tensor | None = None,
+        inference_params: DeChunkState | None = None,
+        mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if inference_params is None:
             assert mask is not None, "Mask must be provided in prefill"
-            assert boundary_mask[:, 0].all() if boundary_mask.dim() == 2 else boundary_mask[0].item() == 1
+            assert (
+                boundary_mask[:, 0].all()
+                if boundary_mask.dim() == 2
+                else boundary_mask[0].item() == 1
+            )
 
         # Extract p probabilities (B, L) or (T,)
         if boundary_prob.shape[-1] == 2:
@@ -919,7 +1079,7 @@ class DeChunkLayer(nn.Module):
             # Packed path: hidden_states are selected boundary states concatenated across batch
             # boundary_mask and p_full correspond to original tokens across batch
             device = hidden_states.device
-            T_total = p_full.shape[0]
+            p_full.shape[0]
             B = cu_seqlens.numel() - 1
 
             # Compute per-sample counts of selected tokens (boundaries)
@@ -940,7 +1100,9 @@ class DeChunkLayer(nn.Module):
             for b in range(B):
                 ks, ke = int(sel_cu[b]), int(sel_cu[b + 1])
                 if ke > ks:
-                    ema_selected[ks:ke] = self._ema_sequence(hidden_states[ks:ke], selected_p[ks:ke])
+                    ema_selected[ks:ke] = self._ema_sequence(
+                        hidden_states[ks:ke], selected_p[ks:ke]
+                    )
 
             # Map EMA back to full token positions via plug-back index = cumsum(boundary_mask)-1
             plug_back_idx = boundary_mask.cumsum(dim=0) - 1  # (T_total,)
@@ -957,7 +1119,9 @@ class DeChunkLayer(nn.Module):
             # Compute EMA along selected tokens for each sample
             # First, sort tokens to bring boundaries to front like reference
             device = hidden_states.device
-            token_idx = torch.arange(L, device=device)[None, :] + (~boundary_mask).long() * L
+            token_idx = (
+                torch.arange(L, device=device)[None, :] + (~boundary_mask).long() * L
+            )
             seq_sorted_indices = torch.argsort(token_idx, dim=1)
 
             # Number of selected (boundary) tokens per sample
@@ -966,19 +1130,27 @@ class DeChunkLayer(nn.Module):
             M = hidden_states.shape[1]
             selected_hidden = hidden_states  # (B, M, D)
             # Align p to the same chunked order and truncate to M
-            p_sorted = torch.gather(p_full, dim=1, index=seq_sorted_indices[:, :M])  # (B, M)
+            p_sorted = torch.gather(
+                p_full, dim=1, index=seq_sorted_indices[:, :M]
+            )  # (B, M)
 
             ema_selected = torch.zeros_like(selected_hidden)
             for b in range(B):
                 m = int(num_tokens[b])
                 if m > 0:
-                    ema_selected[b, :m] = self._ema_sequence(selected_hidden[b, :m], p_sorted[b, :m])
+                    ema_selected[b, :m] = self._ema_sequence(
+                        selected_hidden[b, :m], p_sorted[b, :m]
+                    )
 
-            plug_back_idx = torch.cumsum(boundary_mask, dim=1) - 1  # (B, L), -1 where not boundary yet
+            plug_back_idx = (
+                torch.cumsum(boundary_mask, dim=1) - 1
+            )  # (B, L), -1 where not boundary yet
             out = torch.gather(
                 ema_selected,
                 dim=1,
-                index=plug_back_idx.clamp(min=0).unsqueeze(-1).expand(-1, -1, self.d_model),
+                index=plug_back_idx.clamp(min=0)
+                .unsqueeze(-1)
+                .expand(-1, -1, self.d_model),
             )
             if inference_params is not None:
                 inference_params.last_value.copy_(out[:, -1])
@@ -997,10 +1169,15 @@ class DeChunkLayer(nn.Module):
         p = torch.zeros(B, device=hidden_states.device, dtype=hidden_states.dtype)
         bp = boundary_prob.to(p.dtype)
         p[boundary_mask] = bp[boundary_mask, -1].clamp(1e-4, 1 - 1e-4)
-        current = torch.zeros(B, D, device=hidden_states.device, dtype=hidden_states.dtype)
+        current = torch.zeros(
+            B, D, device=hidden_states.device, dtype=hidden_states.dtype
+        )
         if hidden_states.numel() > 0:
             current[boundary_mask] = hidden_states.squeeze(1)
-        result = p.unsqueeze(-1) * current + (1 - p).unsqueeze(-1) * inference_params.last_value
+        result = (
+            p.unsqueeze(-1) * current
+            + (1 - p).unsqueeze(-1) * inference_params.last_value
+        )
         inference_params.last_value.copy_(result)
         return result.unsqueeze(1)
 
@@ -1026,15 +1203,17 @@ def ste_func(x):
 
 @dataclass
 class HNetState:
-    encoder_state: Optional[IsotropicInferenceParams] = None
-    routing_module_state: Optional[RoutingModuleState] = None
-    main_network_state: Optional[Union["HNetState", IsotropicInferenceParams]] = None
-    dechunk_state: Optional[DeChunkState] = None
-    decoder_state: Optional[IsotropicInferenceParams] = None
+    encoder_state: IsotropicInferenceParams | None = None
+    routing_module_state: RoutingModuleState | None = None
+    main_network_state: HNetState | IsotropicInferenceParams | None = None
+    dechunk_state: DeChunkState | None = None
+    decoder_state: IsotropicInferenceParams | None = None
 
 
 class HNet(nn.Module):
-    def __init__(self, config: HNetConfig, stage_idx: int, device=None, dtype=None) -> None:
+    def __init__(
+        self, config: HNetConfig, stage_idx: int, device=None, dtype=None
+    ) -> None:
         super().__init__()
         factory_kwargs = {"device": device, "dtype": dtype}
         self.stage_idx = stage_idx
@@ -1054,7 +1233,7 @@ class HNet(nn.Module):
         else:
             raise NotImplementedError
 
-        for _name, _layout in zip(sub_model_names, arch_layout):
+        for _name, _layout in zip(sub_model_names, arch_layout, strict=False):
             if self.is_innermost or _name in ("encoder", "decoder"):
                 SubModel = Isotropic
                 _stage_idx = stage_idx
@@ -1064,7 +1243,9 @@ class HNet(nn.Module):
                 SubModel = HNet
                 _stage_idx = stage_idx + 1
                 _pos_idx_dict = {}
-            _sub_model = SubModel(config=config, stage_idx=_stage_idx, **_pos_idx_dict, **factory_kwargs)
+            _sub_model = SubModel(
+                config=config, stage_idx=_stage_idx, **_pos_idx_dict, **factory_kwargs
+            )
             self.add_module(_name, _sub_model)
 
         if not self.is_innermost:
@@ -1072,48 +1253,74 @@ class HNet(nn.Module):
             self.chunk_layer = ChunkLayer()
             self.dechunk_layer = DeChunkLayer(self.d_model)
             # Residual in fp32
-            self.residual_proj = nn.Linear(self.d_model, self.d_model, device=device, dtype=torch.float32)
+            self.residual_proj = nn.Linear(
+                self.d_model, self.d_model, device=device, dtype=torch.float32
+            )
             nn.init.zeros_(self.residual_proj.weight)
             self.residual_proj.weight._no_reinit = True
             self.residual_func = lambda out, residual, p: out * ste_func(p) + residual
 
         if stage_idx > 0 and self.d_model - config.d_model[stage_idx - 1] > 0:
-            self.pad_dimension = nn.Parameter(torch.zeros(self.d_model - config.d_model[stage_idx - 1], **factory_kwargs))
+            self.pad_dimension = nn.Parameter(
+                torch.zeros(
+                    self.d_model - config.d_model[stage_idx - 1], **factory_kwargs
+                )
+            )
         else:
             self.pad_dimension = None
 
     def allocate_inference_cache(self, batch_size: int, max_seqlen: int, dtype=None):
         if self.is_innermost:
-            return HNetState(main_network_state=self.main_network.allocate_inference_cache(batch_size, max_seqlen, dtype=dtype))
+            return HNetState(
+                main_network_state=self.main_network.allocate_inference_cache(
+                    batch_size, max_seqlen, dtype=dtype
+                )
+            )
         else:
             device = self.residual_proj.weight.device
             return HNetState(
-                encoder_state=self.encoder.allocate_inference_cache(batch_size, max_seqlen, dtype=dtype),
-                routing_module_state=self.routing_module.allocate_inference_cache(batch_size, max_seqlen, device, dtype=dtype),
-                main_network_state=self.main_network.allocate_inference_cache(batch_size, max_seqlen, dtype=dtype),
-                dechunk_state=self.dechunk_layer.allocate_inference_cache(batch_size, max_seqlen, device, dtype=dtype),
-                decoder_state=self.decoder.allocate_inference_cache(batch_size, max_seqlen, dtype=dtype),
+                encoder_state=self.encoder.allocate_inference_cache(
+                    batch_size, max_seqlen, dtype=dtype
+                ),
+                routing_module_state=self.routing_module.allocate_inference_cache(
+                    batch_size, max_seqlen, device, dtype=dtype
+                ),
+                main_network_state=self.main_network.allocate_inference_cache(
+                    batch_size, max_seqlen, dtype=dtype
+                ),
+                dechunk_state=self.dechunk_layer.allocate_inference_cache(
+                    batch_size, max_seqlen, device, dtype=dtype
+                ),
+                decoder_state=self.decoder.allocate_inference_cache(
+                    batch_size, max_seqlen, dtype=dtype
+                ),
             )
 
     def forward(
         self,
         hidden_states: torch.Tensor,
-        cu_seqlens: Optional[torch.Tensor] = None,
-        max_seqlen: Optional[int] = None,
-        mask: Optional[torch.Tensor] = None,
-        inference_params: Optional[HNetState] = None,
+        cu_seqlens: torch.Tensor | None = None,
+        max_seqlen: int | None = None,
+        mask: torch.Tensor | None = None,
+        inference_params: HNetState | None = None,
         **mixer_kwargs,
     ):
-        assert mask is not None or (cu_seqlens is not None and max_seqlen is not None), "Provide mask or (cu_seqlens, max_seqlen)"
+        assert mask is not None or (
+            cu_seqlens is not None and max_seqlen is not None
+        ), "Provide mask or (cu_seqlens, max_seqlen)"
         if inference_params is None:
             inference_params = HNetState(main_network_state=None)
         else:
-            assert mask is not None, "Mask must be provided if inference_params is provided"
+            assert mask is not None, (
+                "Mask must be provided if inference_params is provided"
+            )
 
         D = hidden_states.shape[-1]
         early_dims = hidden_states.shape[:-1]
         if self.pad_dimension is not None:
-            hidden_states = torch.cat((hidden_states, self.pad_dimension.expand(early_dims + (-1,))), dim=-1)
+            hidden_states = torch.cat(
+                (hidden_states, self.pad_dimension.expand((*early_dims, -1))), dim=-1
+            )
 
         if self.is_innermost:
             hs = self.main_network(
@@ -1141,9 +1348,16 @@ class HNet(nn.Module):
         residual = self.residual_proj(hs_for_residual)
 
         # Routing
-        bpred_output = self.routing_module(hs, cu_seqlens=cu_seqlens, mask=mask, inference_params=inference_params.routing_module_state)
+        bpred_output = self.routing_module(
+            hs,
+            cu_seqlens=cu_seqlens,
+            mask=mask,
+            inference_params=inference_params.routing_module_state,
+        )
         # Chunk
-        hs_chunk, next_cu, next_max_L, next_mask = self.chunk_layer(hs, bpred_output.boundary_mask, cu_seqlens, mask=mask)
+        hs_chunk, next_cu, next_max_L, next_mask = self.chunk_layer(
+            hs, bpred_output.boundary_mask, cu_seqlens, mask=mask
+        )
 
         # Main inner network
         hs_inner, prev_boundary_predictions = self.main_network(
@@ -1166,7 +1380,9 @@ class HNet(nn.Module):
         )
 
         # Residual fusion with STE gating
-        hs = self.residual_func(hs.to(dtype=residual.dtype), residual, bpred_output.selected_probs).to(hs.dtype)
+        hs = self.residual_func(
+            hs.to(dtype=residual.dtype), residual, bpred_output.selected_probs
+        ).to(hs.dtype)
 
         # Decoder
         hs = self.decoder(
@@ -1184,22 +1400,41 @@ class HNet(nn.Module):
     def step(self, hidden_states: torch.Tensor, inference_params: HNetState):
         D = hidden_states.shape[-1]
         if self.pad_dimension is not None:
-            hidden_states = torch.cat((hidden_states, self.pad_dimension.expand(hidden_states.shape[:-1] + (-1,))), dim=-1)
+            hidden_states = torch.cat(
+                (
+                    hidden_states,
+                    self.pad_dimension.expand((*hidden_states.shape[:-1], -1)),
+                ),
+                dim=-1,
+            )
         if self.is_innermost:
-            hs = self.main_network.step(hidden_states, inference_params.main_network_state)
+            hs = self.main_network.step(
+                hidden_states, inference_params.main_network_state
+            )
             hs = hs[..., :D]
             return hs, []
         hs = self.encoder.step(hidden_states, inference_params.encoder_state)
         hs_for_residual = hs.to(dtype=self.residual_proj.weight.dtype)
         residual = self.residual_proj(hs_for_residual)
-        bpred_output = self.routing_module.step(hs, inference_params.routing_module_state)
+        bpred_output = self.routing_module.step(
+            hs, inference_params.routing_module_state
+        )
         hs_inner = self.chunk_layer.step(hs, bpred_output.boundary_mask)
         if hs_inner.shape[0] > 0:
-            hs_inner, prev_boundary_predictions = self.main_network.step(hs_inner, inference_params.main_network_state)
+            hs_inner, prev_boundary_predictions = self.main_network.step(
+                hs_inner, inference_params.main_network_state
+            )
         else:
             prev_boundary_predictions = []
-        hs = self.dechunk_layer.step(hs_inner, bpred_output.boundary_mask, bpred_output.boundary_prob, inference_params.dechunk_state)
-        hs = self.residual_func(hs.to(dtype=residual.dtype), residual, bpred_output.selected_probs).to(hs.dtype)
+        hs = self.dechunk_layer.step(
+            hs_inner,
+            bpred_output.boundary_mask,
+            bpred_output.boundary_prob,
+            inference_params.dechunk_state,
+        )
+        hs = self.residual_func(
+            hs.to(dtype=residual.dtype), residual, bpred_output.selected_probs
+        ).to(hs.dtype)
         hs = self.decoder.step(hs, inference_params.decoder_state)
         hs = hs[..., :D]
         return hs, [bpred_output, *prev_boundary_predictions]
@@ -1218,26 +1453,32 @@ class HNetForCausalLM(nn.Module):
         d_embed = config.d_model[0]
         self.embeddings = nn.Embedding(config.vocab_size, d_embed, **factory_kwargs)
         self.backbone = HNet(config=config, stage_idx=0, **factory_kwargs)
-        self.lm_head = nn.Linear(d_embed, config.vocab_size, bias=False, **factory_kwargs)
+        self.lm_head = nn.Linear(
+            d_embed, config.vocab_size, bias=False, **factory_kwargs
+        )
         if config.tie_embeddings:
             self.lm_head.weight = self.embeddings.weight
 
     def allocate_inference_cache(self, batch_size: int, max_seqlen: int, dtype=None):
-        return self.backbone.allocate_inference_cache(batch_size, max_seqlen, dtype=dtype)
+        return self.backbone.allocate_inference_cache(
+            batch_size, max_seqlen, dtype=dtype
+        )
 
     def forward(
         self,
         input_ids: torch.Tensor,
-        mask: Optional[torch.Tensor] = None,
+        mask: torch.Tensor | None = None,
         position_ids=None,
-        inference_params: Optional[HNetState] = None,
+        inference_params: HNetState | None = None,
         num_last_tokens: int = 0,
         **mixer_kwargs,
     ):
         hidden_states = self.embeddings(input_ids)
         B, L, D = hidden_states.shape
         if mask is None:
-            assert inference_params is None, "Inference params not supported in packed mode here"
+            assert inference_params is None, (
+                "Inference params not supported in packed mode here"
+            )
             hidden_states = hidden_states.flatten(0, 1)
             cu = torch.arange(B + 1, device=hidden_states.device) * L
             maxL = torch.tensor(L, dtype=torch.int, device=hidden_states.device)
@@ -1263,7 +1504,9 @@ class HNetForCausalLM(nn.Module):
         B = input_ids.shape[0]
         assert B == 1, "step currently supports batch size 1"
         hidden_states = self.embeddings(input_ids)
-        hidden_states, bpred_output = self.backbone.step(hidden_states, inference_params)
+        hidden_states, bpred_output = self.backbone.step(
+            hidden_states, inference_params
+        )
         w_dtype = self.lm_head.weight.dtype
         logits = self.lm_head(hidden_states.to(w_dtype)).to(torch.float32)
         return logits, bpred_output, inference_params
@@ -1280,7 +1523,9 @@ class ByteTokenizer:
         self.bos_idx = 254
         self.eos_idx = 255
 
-    def encode(self, text: str, add_bos: bool = False, add_eos: bool = False) -> torch.Tensor:
+    def encode(
+        self, text: str, add_bos: bool = False, add_eos: bool = False
+    ) -> torch.Tensor:
         b = text.encode("utf-8")
         if add_bos:
             b = bytes([self.bos_idx]) + b
@@ -1326,7 +1571,7 @@ def _top_p_filtering(logits: torch.Tensor, top_p: float) -> torch.Tensor:
 def load_config_from_json(json_path: str) -> HNetConfig:
     import json
 
-    with open(json_path, "r") as f:
+    with open(json_path) as f:
         cfg = json.load(f)
     attn_cfg = AttnConfig(**cfg.pop("attn_cfg"))
     ssm_cfg = SSMConfig(**cfg.pop("ssm_cfg"))
@@ -1334,9 +1579,9 @@ def load_config_from_json(json_path: str) -> HNetConfig:
 
 
 def load_model(
-    model_path: Optional[str],
+    model_path: str | None,
     config_path: str,
-    device: str = None,
+    device: str | None = None,
     dtype: str = "bfloat16",
     strict: bool = True,
 ) -> HNetForCausalLM:
@@ -1361,16 +1606,18 @@ def load_model(
             # Provide debug info to help alignment
             ckpt_keys = sorted(list(state.keys()))
             model_keys = sorted(list(model.state_dict().keys()))
+
             # Print a few around common prefixes
             def head_tail(arr):
                 return arr[:20] + (["..."] if len(arr) > 40 else []) + arr[-20:]
+
             raise RuntimeError(
                 "Error loading state_dict strictly.\n"
                 f"Exception: {e}\n"
                 f"Checkpoint keys sample: {head_tail(ckpt_keys)}\n"
                 f"Model keys sample: {head_tail(model_keys)}\n"
                 "Tip: ensure architecture and parameter names match the reference implementation."
-            )
+            ) from e
     return model
 
 
@@ -1384,7 +1631,9 @@ def generate_tokens(
     device = next(model.parameters()).device
     tok = ByteTokenizer()
     x = tok.encode(prompt, add_bos=True).to(device)[None, :]
-    cache = model.allocate_inference_cache(1, x.shape[1] + max_new_tokens, dtype=next(model.parameters()).dtype)
+    cache = model.allocate_inference_cache(
+        1, x.shape[1] + max_new_tokens, dtype=next(model.parameters()).dtype
+    )
     with torch.inference_mode():
         mask = torch.ones_like(x, dtype=torch.bool, device=device)
         logits, _, _ = model.forward(x, mask=mask, inference_params=cache)
@@ -1405,23 +1654,46 @@ def generate_tokens(
 
 def main():
     import argparse
+
     parser = argparse.ArgumentParser(description="H-Net PyTorch (no Triton) generator")
-    parser.add_argument("--config-path", type=str, required=True, help="Path to config JSON (e.g., hnet-reference/configs/hnet_2stage_L.json)")
-    parser.add_argument("--model-path", type=str, default=None, help="Path to .pt weights (optional; non-strict load)")
+    parser.add_argument(
+        "--config-path",
+        type=str,
+        required=True,
+        help="Path to config JSON (e.g., hnet-reference/configs/hnet_2stage_L.json)",
+    )
+    parser.add_argument(
+        "--model-path",
+        type=str,
+        default=None,
+        help="Path to .pt weights (optional; non-strict load)",
+    )
     parser.add_argument("--prompt", type=str, required=True, help="UTF-8 prompt text")
     parser.add_argument("--max-new-tokens", type=int, default=128)
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--top-p", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", type=str, default=None)
-    parser.add_argument("--dtype", type=str, default="bfloat16", choices=["bfloat16", "float32"]) 
-    parser.add_argument("--strict", action="store_true", help="Strict state_dict load (fail on any mismatch)")
+    parser.add_argument(
+        "--dtype", type=str, default="bfloat16", choices=["bfloat16", "float32"]
+    )
+    parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="Strict state_dict load (fail on any mismatch)",
+    )
     args = parser.parse_args()
 
     # Set manual seed for deterministic sampling
     torch.manual_seed(args.seed)
 
-    model = load_model(args.model_path, args.config_path, device=args.device, dtype=args.dtype, strict=args.strict)
+    model = load_model(
+        args.model_path,
+        args.config_path,
+        device=args.device,
+        dtype=args.dtype,
+        strict=args.strict,
+    )
     tok = ByteTokenizer()
     print(args.prompt, end="", flush=True)
     buf = []

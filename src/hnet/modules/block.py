@@ -1,316 +1,69 @@
-# Copyright (c) 2025, Nick Wall.
-# JAX implementation of hybrid transformer blocks combining Mamba2 and attention
+"""High-level block and isotropic stack primitives."""
+
+from __future__ import annotations
 
 import flax.nnx as nnx
-import jax
+import jax.numpy as jnp
 
-from hnet.models.config_hnet import AttnConfig, SSMConfig
-from hnet.modules.cache import CacheState, create_mamba2_cache
-from hnet.modules.config import (
-    AttentionConfig,
-    HybridConfig,
-    Mamba2Config,
-)
-from hnet.modules.mamba2 import Mamba2Block
-from hnet.modules.mha import CausalMHA
-from hnet.modules.swiglu import SwiGLU
+from hnet.modules.norms import RMSNorm
 
 
-class HybridBlock(nnx.Module):
-    """
-    A hybrid block that can use either Mamba2 or Attention as the sequence mixing layer.
-
-    This follows the structure of modern hybrid architectures like Jamba.
-    """
-
-    mixer: Mamba2Block | CausalMHA
-
+class Block(nnx.Module):
     def __init__(
         self,
-        config: HybridConfig,
-        *,
-        rngs: nnx.Rngs,
+        d_model: int,
+        mixer: nnx.Module,
+        mlp: nnx.Module | None,
+        residual_in_fp32: bool = True,
+        rngs: nnx.Rngs = nnx.Rngs(0),
     ):
-        """
-        Initialize hybrid block.
-
-        Args:
-            config: Hybrid block configuration
-            rngs: Random number generators
-        """
-        self.config = config
-        self.use_mamba = config.use_mamba
-        self.layer_idx = config.layer_idx
-
-        # Pre-norm for sequence mixing
-        self.norm1 = nnx.RMSNorm(config.d_model, epsilon=config.norm_epsilon, rngs=rngs)
-
-        # Sequence mixing layer
-        if config.use_mamba:
-            assert config.mamba_config is not None
-            self.mixer = Mamba2Block(
-                config=config.mamba_config,
-                rngs=rngs,
-            )
-        else:
-            assert config.attention_config is not None
-            self.mixer = CausalMHA(
-                config=config.attention_config,
-                rngs=rngs,
-            )
-
-        # Pre-norm for MLP
-        if config.mlp_expand > 0 or (
-            config.d_intermediate and config.d_intermediate > 0
-        ):
-            self.norm2 = nnx.RMSNorm(
-                config.d_model, epsilon=config.norm_epsilon, rngs=rngs
-            )
-
-            # MLP - use exact d_intermediate if provided, otherwise calculate from mlp_expand
-            if config.d_intermediate and config.d_intermediate > 0:
-                d_intermediate = config.d_intermediate
-            else:
-                d_intermediate = config.d_model * config.mlp_expand
-            self.mlp = SwiGLU(
-                d_model=config.d_model,
-                d_intermediate=d_intermediate,
-                rngs=rngs,
-            )
-        else:
-            self.norm2 = None
-            self.mlp = None
+        self.residual_in_fp32 = residual_in_fp32
+        self.norm1 = RMSNorm(d_model, rngs=rngs)
+        self.mixer = mixer
+        self.mlp = mlp
+        if self.mlp is not None:
+            self.norm2 = RMSNorm(d_model, rngs=rngs)
 
     def __call__(
         self,
-        x: jax.Array,
-        cache: CacheState | None = None,
-    ) -> tuple[jax.Array, CacheState | None]:
-        """
-        Forward pass of hybrid block.
-
-        Args:
-            x: Input tensor of shape (batch, seq_len, d_model)
-            cache: Optional cache state for inference mode
-
-        Returns:
-            output: Output tensor of shape (batch, seq_len, d_model)
-            updated_cache: Updated cache state (if cache was provided)
-        """
-        # Sequence mixing with residual
-        residual = x
-        x = self.norm1(x)
-
-        # Use isinstance to help the type checker
-        if isinstance(self.mixer, Mamba2Block):
-            # Get Mamba cache for this layer if available
-            mamba_cache = (
-                cache.get_mamba(self.layer_idx)
-                if cache and self.layer_idx is not None
-                else None
+        x: jnp.ndarray,
+        residual: jnp.ndarray | None = None,
+        inference_params=None,
+        mixer_kwargs: dict | None = None,
+    ) -> tuple[jnp.ndarray, jnp.ndarray | None]:
+        x, residual = self.norm1(
+            x, residual=residual, prenorm=True, residual_in_fp32=self.residual_in_fp32
+        )
+        mixer_kwargs = mixer_kwargs or {}
+        x = self.mixer(x, **mixer_kwargs, inference_params=inference_params)
+        if self.mlp is not None:
+            x, residual = self.norm2(
+                x,
+                residual=residual,
+                prenorm=True,
+                residual_in_fp32=self.residual_in_fp32,
             )
-            x, updated_mamba_cache = self.mixer(x, cache=mamba_cache)
-
-            # Update cache if needed
-            if (
-                cache is not None
-                and updated_mamba_cache is not None
-                and self.layer_idx is not None
-            ):
-                cache = cache.update_mamba(self.layer_idx, updated_mamba_cache)
-
-        elif isinstance(self.mixer, CausalMHA):
-            # Get attention cache for this layer if available
-            attn_cache = (
-                cache.get_attention(self.layer_idx)
-                if cache and self.layer_idx is not None
-                else None
-            )
-            x, updated_attn_cache = self.mixer(x, cache=attn_cache)
-
-            # Update cache if needed
-            if (
-                cache is not None
-                and updated_attn_cache is not None
-                and self.layer_idx is not None
-            ):
-                cache = cache.update_attention(self.layer_idx, updated_attn_cache)
-        else:
-            raise ValueError(f"Unknown mixer type: {type(self.mixer)}")
-
-        x = residual + x
-
-        # MLP with residual (if present)
-        if self.mlp is not None and self.norm2 is not None:
-            residual = x
-            x = self.norm2(x)
             x = self.mlp(x)
-            x = residual + x
+        return x, residual
 
-        return x, cache
-
-
-class Mamba2Wrapper(nnx.Module):
-    """
-    Mamba2 wrapper class that has the same inference interface as the CausalMHA class.
-
-    This provides compatibility with existing transformer code.
-    """
-
-    def __init__(
-        self,
-        config: Mamba2Config,
-        *,
-        rngs: nnx.Rngs,
+    def allocate_inference_cache(
+        self, batch_size: int, max_seqlen: int, dtype=None, **kwargs
     ):
-        """Initialize Mamba2 wrapper."""
-        self.config = config
-        self.layer_idx = config.layer_idx
-        self.mamba = Mamba2Block(
-            config=config,
-            rngs=rngs,
+        return None
+
+    def step(
+        self, x: jnp.ndarray, inference_params, residual: jnp.ndarray | None = None
+    ):
+        x, residual = self.norm1(
+            x, residual=residual, prenorm=True, residual_in_fp32=self.residual_in_fp32
         )
-
-    def __call__(
-        self, x: jax.Array, cache: CacheState | None = None
-    ) -> tuple[jax.Array, CacheState | None]:
-        """Forward pass through wrapped Mamba2Block."""
-        # Get Mamba cache for this layer if available
-        mamba_cache = (
-            cache.get_mamba(self.layer_idx)
-            if cache and self.layer_idx is not None
-            else None
-        )
-        output, updated_mamba_cache = self.mamba(x, cache=mamba_cache)
-
-        # Update cache if needed
-        if (
-            cache is not None
-            and updated_mamba_cache is not None
-            and self.layer_idx is not None
-        ):
-            cache = cache.update_mamba(self.layer_idx, updated_mamba_cache)
-
-        return output, cache
-
-    def step(self, x: jax.Array, cache: CacheState) -> tuple[jax.Array, CacheState]:
-        """Single step for generation."""
-        # Get or create Mamba cache for this layer
-        mamba_cache = (
-            cache.get_mamba(self.layer_idx) if self.layer_idx is not None else None
-        )
-
-        if mamba_cache is None and self.layer_idx is not None:
-            # Initialize cache if not present
-            batch_size = x.shape[0]
-            mamba_cache = create_mamba2_cache(
-                batch_size,
-                self.mamba.mamba.d_inner,
-                self.mamba.mamba.d_state,
-                self.mamba.mamba.d_conv,
-                self.mamba.mamba.nheads,
-                self.mamba.mamba.headdim,
+        x = self.mixer.step(x, inference_params)
+        if self.mlp is not None:
+            x, residual = self.norm2(
+                x,
+                residual=residual,
+                prenorm=True,
+                residual_in_fp32=self.residual_in_fp32,
             )
-            cache = cache.update_mamba(self.layer_idx, mamba_cache)
-
-        # Call Mamba2Block with cache
-        output, updated_cache = self.mamba(x, cache=mamba_cache)
-
-        # Update cache if needed
-        if updated_cache is not None and self.layer_idx is not None:
-            cache = cache.update_mamba(self.layer_idx, updated_cache)
-
-        return output, cache
-
-
-def create_block(
-    arch: str,
-    d_model: int,
-    d_intermediate: int,
-    ssm_cfg: SSMConfig,
-    attn_cfg: AttnConfig,
-    layer_idx: int,
-    rngs: nnx.Rngs,
-) -> HybridBlock:
-    """
-    Create a hybrid block based on architecture string.
-
-    Args:
-        arch: Architecture type - 'm'/'M' for Mamba2, 't'/'T' for Transformer/MHA
-        d_model: Model dimension
-        d_intermediate: Intermediate dimension for FFN
-        ssm_cfg: SSM configuration
-        attn_cfg: Attention configuration
-        layer_idx: Layer index
-        rngs: Random number generators
-        **kwargs: Additional arguments (for compatibility)
-
-    Returns:
-        HybridBlock instance
-    """
-    use_mamba = arch in ("m", "M")
-
-    if use_mamba:
-        # Create Mamba2Config from SSMConfig
-        mamba_config = Mamba2Config(
-            d_model=d_model,
-            d_state=ssm_cfg.d_state,
-            d_conv=ssm_cfg.d_conv,
-            expand=ssm_cfg.expand,
-            chunk_size=ssm_cfg.chunk_size,
-            layer_idx=layer_idx,
-        )
-        config = HybridConfig(
-            d_model=d_model,
-            n_heads=0,  # Not used for Mamba
-            use_mamba=True,
-            mlp_expand=d_intermediate // d_model if d_intermediate > 0 else 0,
-            d_intermediate=d_intermediate if d_intermediate > 0 else None,
-            layer_idx=layer_idx,
-            mamba_config=mamba_config,
-        )
-    else:
-        # Create AttentionConfig from AttnConfig
-        # Note: attn_cfg values are already scalars after get_stage_cfg processing
-        # Handle both list and scalar cases for type safety
-        if isinstance(attn_cfg.num_heads, list):
-            num_heads = int(attn_cfg.num_heads[0]) if attn_cfg.num_heads else 8
-        else:
-            num_heads = int(attn_cfg.num_heads) if attn_cfg.num_heads is not None else 8
-
-        if isinstance(attn_cfg.rotary_emb_dim, list):
-            rotary_emb_dim = (
-                int(attn_cfg.rotary_emb_dim[0]) if attn_cfg.rotary_emb_dim else 0
-            )
-        else:
-            rotary_emb_dim = (
-                int(attn_cfg.rotary_emb_dim)
-                if attn_cfg.rotary_emb_dim is not None
-                else 0
-            )
-
-        if isinstance(attn_cfg.window_size, list):
-            window_size = int(attn_cfg.window_size[0]) if attn_cfg.window_size else -1
-        else:
-            window_size = (
-                int(attn_cfg.window_size) if attn_cfg.window_size is not None else -1
-            )
-
-        attention_config = AttentionConfig(
-            d_model=d_model,
-            num_heads=num_heads,
-            layer_idx=layer_idx,
-            rotary_emb_dim=rotary_emb_dim,
-            window_size=window_size,
-        )
-        config = HybridConfig(
-            d_model=d_model,
-            n_heads=num_heads,
-            use_mamba=False,
-            mlp_expand=d_intermediate // d_model if d_intermediate > 0 else 0,
-            d_intermediate=d_intermediate if d_intermediate > 0 else None,
-            layer_idx=layer_idx,
-            attention_config=attention_config,
-        )
-
-    return HybridBlock(config=config, rngs=rngs)
+            x = self.mlp(x)
+        return x, residual
