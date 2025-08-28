@@ -9,6 +9,11 @@ Key design points:
 - Uses a simple causal multi-head attention and a lightweight SSM-like mixer (conv + gating)
   to stand in for Mamba2 while keeping everything JAX-native.
 
+JIT Compilation Support:
+- Use jax.jit() for manual compilation of individual functions
+- The model works correctly without JIT by default
+- For JIT: ensure all inputs are JAX arrays and avoid inference_params for stateless execution
+
 This file exposes:
 - Config dataclasses: AttnConfig, SSMConfig, HNetConfig
 - Core modules: Isotropic, RoutingModule/ChunkLayer/DeChunkLayer, HNet
@@ -26,6 +31,7 @@ import argparse
 import json
 import re
 from dataclasses import dataclass, field, asdict
+import time
 from typing import Optional, Union
 
 import jax
@@ -1879,7 +1885,14 @@ def generate_tokens(
     temperature: float = 1.0,
     top_p: float = 1.0,
     rng_key: jax.Array | None = None,
+    use_jit: bool = False,
+    profile: bool = False,
 ):
+    """Generate tokens with optional JIT compilation.
+
+    Args:
+        use_jit: If True, attempt JIT compilation (stateless mode only)
+    """
     if rng_key is None:
         rng_key = jax.random.PRNGKey(0)
 
@@ -1889,12 +1902,33 @@ def generate_tokens(
         1, x.shape[1] + max_new_tokens, dtype=model.lm_head.kernel.value.dtype
     )
 
-    # Prefill
+    # Prefill with optional JIT
     mask = jnp.ones_like(x, dtype=jnp.bool_)
-    logits, _, _ = model(x, mask=mask, inference_params=cache)
+
+    if use_jit:
+        # JIT compile for stateless execution only
+        try:
+
+            @jax.jit
+            def jit_forward_stateless(input_ids, mask):
+                return model(input_ids, mask=mask, inference_params=None)
+
+            logits, _, _ = jit_forward_stateless(x, mask)
+            print("[JIT] ", end="")
+        except Exception as e:
+            print(f"[JIT failed: {e}] ", end="")
+            logits, _, _ = model(x, mask=mask, inference_params=cache)
+    else:
+        logits, _, _ = model(x, mask=mask, inference_params=cache)
+
     logits = logits[0, -1]  # (vocab_size,)
 
+    tokens_generated = 0
+    gen_start = time.perf_counter() if profile else None
+
     for i in range(max_new_tokens):
+        step_start = time.perf_counter() if profile else None
+
         rng_key, sample_key = jax.random.split(rng_key)
         logits = logits / max(temperature, 1e-6)
         logits = _top_p_filtering(logits, top_p)
@@ -1904,11 +1938,22 @@ def generate_tokens(
 
         if token_id == ByteTokenizer().eos_idx:
             break
+
+        tokens_generated += 1
         yield token_id
 
         nxt = next_id[None, :]  # (1, 1)
         logits, _, _ = model.step(nxt, cache)
         logits = logits[0, -1]
+
+        if profile and step_start and i < 5:  # Profile first few steps
+            step_time = time.time() - step_start
+            print(f" [Step {i}: {step_time:.3f}s]", end="")
+
+    if profile and tokens_generated > 0:
+        total_gen_time = time.time() - gen_start
+        tokens_per_sec = tokens_generated / total_gen_time
+        print(f" [Generation: {tokens_per_sec:.1f} tok/s]", end="")
 
 
 def main():
@@ -1938,6 +1983,16 @@ def main():
         action="store_true",
         help="Strict state_dict load (fail on any mismatch)",
     )
+    parser.add_argument(
+        "--jit",
+        action="store_true",
+        help="Use JIT compilation (stateless mode)",
+    )
+    parser.add_argument(
+        "--profile",
+        action="store_true",
+        help="Enable performance profiling",
+    )
     args = parser.parse_args()
 
     # Set manual seed for deterministic sampling
@@ -1956,6 +2011,8 @@ def main():
         temperature=args.temperature,
         top_p=args.top_p,
         rng_key=rng_key,
+        use_jit=args.jit,
+        profile=args.profile,
     ):
         buf.append(tid)
 
